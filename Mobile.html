@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Tennis — Mobile</title>
+  <style>
+    html,body{height:100%;margin:0;background:#0b0b0b;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+    .host{position:relative;width:100%;height:100dvh;overflow:hidden}
+    iframe{width:100%;height:100%;border:0;background:#111}
+    .overlay{position:absolute;inset:0;display:none;background:rgba(0,0,0,.45);backdrop-filter:blur(6px)}
+    .overlay.show{display:block}
+  </style>
+</head>
+<body>
+  <main class="host">
+    <iframe id="iframeBoard" src="CourtBoard.html" title="Court Board"></iframe>
+    <div id="regOverlay" class="overlay" aria-hidden="true">
+      <div style="position:absolute;top:10px;right:10px;z-index:1000;">
+        <button onclick="hideReg()" style="background:rgba(0,0,0,0.8);color:white;border:none;border-radius:50%;width:40px;height:40px;font-size:20px;cursor:pointer;">✕</button>
+      </div>
+      <iframe id="iframeReg" src="Registration.html" title="Registration"></iframe>
+    </div>
+  </main>
+
+  <script>
+    const overlay   = document.getElementById('regOverlay');
+    const iframeReg = document.getElementById('iframeReg');
+    const iframeBoard = document.getElementById('iframeBoard');
+
+    function showReg(courtNumber){
+      overlay.classList.add('show');
+      overlay.setAttribute('aria-hidden','false');
+      // ask Registration to start (no reload)
+      try { iframeReg.contentWindow.postMessage({ type:'register', courtNumber:Number(courtNumber) }, '*'); } catch {}
+    }
+    function hideReg(){
+      overlay.classList.remove('show');
+      overlay.setAttribute('aria-hidden','true');
+    }
+
+    // Receive events from child iframes
+    window.addEventListener('message', e => {
+      const d = e?.data; if (!d) return;
+      console.log('Mobile Shell: Received message:', d);
+      
+      if (d.type === 'register') {
+        console.log('Mobile Shell: Opening registration for court', d.courtNumber);
+        showReg(d.courtNumber);
+      } else if (d.type === 'registration:success') {
+        console.log('Mobile Shell: Registration success for court', d.courtNumber, '- closing overlay in 5 seconds');
+        // Show success screen for 5 seconds before closing
+        setTimeout(() => {
+          hideReg();
+          console.log('Mobile Shell: Closing overlay after 5 second delay');
+        }, 5000);
+        // visual confirmation on the board immediately
+        try { iframeBoard.contentWindow.postMessage({ type:'highlight', courtNumber: Number(d.courtNumber) }, '*'); } catch {}
+      }
+    });
+  </script>
+</body>
+</html>

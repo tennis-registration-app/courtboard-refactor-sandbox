@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clear All Tennis App Data</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 50px auto;
+      padding: 20px;
+      background-color: #f5f5f5;
+    }
+    .container {
+      background: white;
+      padding: 30px;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    button {
+      background-color: #dc3545;
+      color: white;
+      border: none;
+      padding: 15px 30px;
+      font-size: 18px;
+      border-radius: 5px;
+      cursor: pointer;
+      margin: 10px;
+    }
+    button:hover {
+      background-color: #c82333;
+    }
+    .safe-button {
+      background-color: #28a745;
+    }
+    .safe-button:hover {
+      background-color: #218838;
+    }
+    .log {
+      background-color: #f8f9fa;
+      border: 1px solid #dee2e6;
+      padding: 15px;
+      margin-top: 20px;
+      border-radius: 5px;
+      font-family: monospace;
+      font-size: 14px;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    .warning {
+      background-color: #fff3cd;
+      border: 1px solid #ffeaa7;
+      color: #856404;
+      padding: 15px;
+      border-radius: 5px;
+      margin-bottom: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Tennis App Data Management</h1>
+    
+    <div class="warning">
+      <strong>⚠️ Warning:</strong> The tennis app has automatic data restoration systems that run every 10-15 seconds. 
+      These will restore "wiped" data from backup storage locations.
+    </div>
+
+    <h2>Clear Data Options:</h2>
+    
+    <button onclick="clearMainData()" class="safe-button">Clear Main Data Only</button>
+    <button onclick="clearAllData()">Clear ALL Data (Including Backups)</button>
+    <button onclick="listAllData()" style="background-color: #17a2b8;">List All Stored Data</button>
+    
+    <div id="log" class="log"></div>
+  </div>
+
+  <script>
+    const log = (message) => {
+      const logDiv = document.getElementById('log');
+      const timestamp = new Date().toLocaleTimeString();
+      logDiv.innerHTML += `[${timestamp}] ${message}<br>`;
+      logDiv.scrollTop = logDiv.scrollHeight;
+    };
+
+    const clearMainData = () => {
+      log('Clearing main data keys...');
+      const mainKeys = [
+        'tennisClubData',
+        'tennisClubSettings',
+        'courtBlocks',
+        'tennisBallPurchases',
+        'tennisDataUpdateTick'
+      ];
+      
+      mainKeys.forEach(key => {
+        if (localStorage.getItem(key)) {
+          localStorage.removeItem(key);
+          log(`✓ Removed: ${key}`);
+        }
+      });
+      
+      log('<strong style="color: orange;">⚠️ Note: Backup data still exists and will be restored!</strong>');
+    };
+
+    const clearAllData = () => {
+      if (!confirm('This will clear ALL tennis app data including backups. Are you sure?')) {
+        return;
+      }
+      
+      log('Clearing ALL tennis app data...');
+      
+      // Get all localStorage keys
+      const allKeys = Object.keys(localStorage);
+      const tennisKeys = allKeys.filter(key => {
+        return key.includes('tennis') || 
+               key.includes('court') || 
+               key.includes('Court') ||
+               key.includes('ball') ||
+               key.includes('Ball') ||
+               key.includes('guest') ||
+               key.includes('analytics');
+      });
+      
+      log(`Found ${tennisKeys.length} tennis-related keys to remove`);
+      
+      // Remove each key
+      tennisKeys.forEach(key => {
+        localStorage.removeItem(key);
+        log(`✓ Removed: ${key}`);
+      });
+      
+      // Also remove specific backup keys that might not match the pattern
+      for (let i = 1; i <= 12; i++) {
+        const backupKey = `courtHistory_${i}`;
+        if (localStorage.getItem(backupKey)) {
+          localStorage.removeItem(backupKey);
+          log(`✓ Removed backup: ${backupKey}`);
+        }
+      }
+      
+      log('<strong style="color: green;">✅ All data cleared successfully!</strong>');
+      log('');
+      log('🔄 <strong>IMPORTANT:</strong> You should refresh all tennis app tabs now to prevent the restoration systems from running.');
+    };
+
+    const listAllData = () => {
+      log('Listing all tennis-related data...');
+      const allKeys = Object.keys(localStorage);
+      const tennisKeys = allKeys.filter(key => {
+        return key.includes('tennis') || 
+               key.includes('court') || 
+               key.includes('Court') ||
+               key.includes('ball') ||
+               key.includes('Ball') ||
+               key.includes('guest') ||
+               key.includes('analytics');
+      });
+      
+      // Also check for numbered court history backups
+      for (let i = 1; i <= 12; i++) {
+        const backupKey = `courtHistory_${i}`;
+        if (localStorage.getItem(backupKey) && !tennisKeys.includes(backupKey)) {
+          tennisKeys.push(backupKey);
+        }
+      }
+      
+      if (tennisKeys.length === 0) {
+        log('No tennis-related data found in localStorage');
+        return;
+      }
+      
+      log(`Found ${tennisKeys.length} tennis-related keys:`);
+      tennisKeys.sort().forEach(key => {
+        const value = localStorage.getItem(key);
+        const size = value ? value.length : 0;
+        let preview = '';
+        
+        try {
+          const parsed = JSON.parse(value);
+          if (Array.isArray(parsed)) {
+            preview = ` (Array with ${parsed.length} items)`;
+          } else if (typeof parsed === 'object') {
+            preview = ` (Object)`;
+          }
+        } catch {
+          preview = ' (String/Other)';
+        }
+        
+        log(`• ${key}: ${(size/1024).toFixed(2)}KB${preview}`);
+      });
+    };
+
+    // Auto-list data on load
+    window.onload = () => {
+      log('Tennis App Data Management Tool Loaded');
+      log('---');
+      listAllData();
+    };
+  </script>
+</body>
+</html>
