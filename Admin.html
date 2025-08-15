@@ -16,6 +16,13 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <!-- Shared utils (schema + helpers; no UI changes) -->
   <script src="./shared-utils.js"></script>
+  <script src="./shared/config.js"></script>
+  <script src="./shared/storage.js"></script>
+  <script src="./shared/events.js"></script>
+  <script src="./shared/datastore.js"></script>
+  <script src="./domain/time.js"></script>
+  <script src="./domain/blocks.js"></script>
+  <script src="./domain/wetCourts.js"></script>
   <!-- Preflight self-heal (normalize storage shape before app code runs) -->
   <script>try{ window.APP_UTILS && window.APP_UTILS.readDataSafe(); }catch(e){}</script>
   
@@ -28,6 +35,13 @@
    const U = window.APP_UTILS || {};
    // --- One-time guard helper (no UI change)
    const _one = (key) => (window[key] ? true : (window[key] = true, false));
+   
+   // Shared domain modules
+   const USE_SHARED_DOMAIN = true;
+   const WC = window.Tennis.Domain.wetCourts || window.Tennis.Domain.WetCourts;
+   const Storage = window.Tennis.Storage;
+   const Events = window.Tennis.Events;
+   const BL = window.Tennis.Domain.blocks || window.Tennis.Domain.Blocks; // handle both names
    
    // ---- Storage & Event keys (constants; no behavior change) ----
    const STORAGE = {
@@ -3664,9 +3678,16 @@ const CompleteBlockManagerEnhanced = ({
   console.log('🌧️ Emergency wet court activated');
   
   // Set all courts as wet
-  const allCourts = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  const allCourts = new Set();
+  [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].forEach(courtNum => {
+    WC.markWet(allCourts, courtNum);
+  });
   setWetCourts(allCourts);
   setWetCourtsActive(true);
+
+  // Notify (preserve legacy event name for other pages)
+  const nextWet = Array.from(allCourts).sort((a,b)=>a-b);
+  Events.emitDom('tennisDataUpdate', { key: 'wetCourts', data: nextWet });
   
   // Create wet court blocks immediately with explicit court list
   try {
@@ -3764,8 +3785,12 @@ const clearWetCourt = (courtNumber) => {
   console.log(`☀️ Clearing wet court ${courtNumber}`);
   
   const newWetCourts = new Set(wetCourts);
-  newWetCourts.delete(courtNumber);
+  WC.clearWet(newWetCourts, courtNumber);
   setWetCourts(newWetCourts);
+
+  // Notify (preserve legacy event name for other pages)
+  const nextWet = Array.from(newWetCourts).sort((a,b)=>a-b);
+  Events.emitDom('tennisDataUpdate', { key: 'wetCourts', data: nextWet });
 
   // Remove wet court block for this court
   removeWetCourtBlock(courtNumber);
@@ -4652,20 +4677,54 @@ const MockAIAdmin = ({ onClose, dataStore, courts, loadData, clearCourt, clearAl
         startDateTime.setHours(parseInt(startHour), parseInt(startMin), 0, 0);
         endDateTime.setHours(parseInt(endHour), parseInt(endMin), 0, 0);
         
-        // Add blocks to localStorage
-        let existingBlocks = [];
-        try { existingBlocks = JSON.parse(localStorage.getItem('courtBlocks') || '[]'); }
-        catch { /* transient partial write; use empty array */ }
-        const newBlocks = action.courts.map(courtNum => ({
-          id: `block-${Date.now()}-${courtNum}`,
-          courtNumber: courtNum,
-          reason: action.reason,
-          startTime: startDateTime.toISOString(),
-          endTime: endDateTime.toISOString(),
-          createdAt: new Date().toISOString()
-        }));
-        const updatedBlocks = [...existingBlocks, ...newBlocks];
-        localStorage.setItem('courtBlocks', JSON.stringify(updatedBlocks));
+        // read form values from existing variables
+        const name = action.reason || 'Block'; // use reason as name for mock commands
+        const reason = action.reason || '';
+        const durationMinutes = Math.round((endDateTime - startDateTime) / (1000 * 60));
+        const selectedCourts = action.courts;
+
+        // validate minimally
+        if (!name || !reason || !Number.isFinite(durationMinutes) || durationMinutes <= 0 || !Array.isArray(selectedCourts) || selectedCourts.length === 0) {
+          alert('Please provide name, reason, positive duration, and at least one court.');
+          return;
+        }
+
+        const template = { name, reason, duration: Number(durationMinutes), courts: selectedCourts };
+        const now = new Date();
+
+        // domain: build blocks (one per court)
+        const newBlocks = BL.applyTemplate({ template, now }); // <-- correct call shape
+
+        // load/persist using existing key
+        const key = Storage.STORAGE.BLOCKS; // "courtBlocks"
+        const existing = Storage.readJSON(key) || [];
+
+        // Prevent conflicts: if any new block overlaps an existing block on the same court, abort with a clear message.
+        const conflicts = [];
+        for (const nb of newBlocks) {
+          for (const b of existing) {
+            if (b.courtNumber === nb.courtNumber && BL.overlaps(nb, b)) {
+              conflicts.push(nb.courtNumber);
+              break;
+            }
+          }
+        }
+        if (conflicts.length) {
+          alert(`Cannot add blocks. Overlaps on courts: ${[...new Set(conflicts)].sort((a,b)=>a-b).join(', ')}`);
+          return;
+        }
+
+        // Preserve additional properties
+        for (const nb of newBlocks) {
+          nb.id = `block-${Date.now()}-${nb.courtNumber}`;
+          nb.createdAt = new Date().toISOString();
+        }
+
+        const next = existing.concat(newBlocks);
+        Storage.writeJSON(key, next);
+        Events.emitDom('tennisDataUpdate', { key, data: next }); // notify other pages
+        console.log('[Admin] wrote blocks:', newBlocks);
+        
         refreshData();
         
         return `✓ Blocked court${action.courts.length > 1 ? 's' : ''} ${action.courts.join(', ')}`;
@@ -5122,9 +5181,16 @@ const AdminPanelV2 = ({ onExit }) => {
   console.log('🌧️ Emergency wet court activated');
   
   // Set all courts as wet in state immediately
-  const allCourts = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  const allCourts = new Set();
+  [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].forEach(courtNum => {
+    WC.markWet(allCourts, courtNum);
+  });
   setWetCourts(allCourts);
   setWetCourtsActive(true);
+
+  // Notify (preserve legacy event name for other pages)
+  const nextWet = Array.from(allCourts).sort((a,b)=>a-b);
+  Events.emitDom('tennisDataUpdate', { key: 'wetCourts', data: nextWet });
   
   try {
     const now = new Date().toISOString();
@@ -5200,8 +5266,12 @@ const clearWetCourt = (courtNumber) => {
   console.log(`☀️ Clearing wet court ${courtNumber}`);
   
   const newWetCourts = new Set(wetCourts);
-  newWetCourts.delete(courtNumber);
+  WC.clearWet(newWetCourts, courtNumber);
   setWetCourts(newWetCourts);
+
+  // Notify (preserve legacy event name for other pages)
+  const nextWet = Array.from(newWetCourts).sort((a,b)=>a-b);
+  Events.emitDom('tennisDataUpdate', { key: 'wetCourts', data: nextWet });
 
   // Remove wet court block for this court
   try {
@@ -5491,41 +5561,59 @@ const existingBlocks = courts.filter(c => c?.blocked).map((c, i) => ({
     
     // Process all blocks and courts
     for (const block of blocks) {
-      // Extract date from ISO timestamp
+      // read form values from existing variables
+      const name = block.title || block.name || '';
+      const reason = block.reason || '';
       const startTime = new Date(block.startTime);
       const endTime = new Date(block.endTime);
-      
-      // Add blocks to each court (handle single courtNumber)
-      const courts = Array.isArray(block.courts) ? block.courts : [block.courtNumber];
-      
-      for (const courtNum of courts) {
-        try {
-          // Get existing blocks
-          const existingBlocks = await dataStore.get('courtBlocks') || [];
-          
-          // Add new block
-          existingBlocks.push({
-            id: block.id || Date.now() + Math.random(),
-            courtNumber: courtNum,
-            reason: block.reason,
-            title: block.title, // Preserve the custom title
-            startTime: block.startTime,
-            endTime: block.endTime,
-            isEvent: block.isEvent,
-            eventDetails: block.eventDetails,
-            createdAt: new Date().toISOString()
-          });
-          
-          // Save back
-          await dataStore.set('courtBlocks', existingBlocks, { immediate: true });
-          successCount++;
-        } catch (error) {
-          console.error('Error applying block to court', courtNum, error);
+      const durationMinutes = Math.round((endTime - startTime) / (1000 * 60));
+      const selectedCourts = Array.isArray(block.courts) ? block.courts : [block.courtNumber];
+
+      // validate minimally
+      if (!name || !reason || !Number.isFinite(durationMinutes) || durationMinutes <= 0 || !Array.isArray(selectedCourts) || selectedCourts.length === 0) {
+        alert('Please provide name, reason, positive duration, and at least one court.');
+        return;
+      }
+
+      const template = { name, reason, duration: Number(durationMinutes), courts: selectedCourts };
+      const now = new Date();
+
+      // domain: build blocks (one per court)
+      const newBlocks = BL.applyTemplate({ template, now }); // <-- correct call shape
+
+      // load/persist using existing key
+      const key = Storage.STORAGE.BLOCKS; // "courtBlocks"
+      const existing = Storage.readJSON(key) || [];
+
+      // optional: prevent overlaps (keeps current UX; skip if you already do this elsewhere)
+      const conflicts = [];
+      for (const nb of newBlocks) {
+        for (const b of existing) {
+          if (b.courtNumber === nb.courtNumber && BL.overlaps(nb, b)) { conflicts.push(nb.courtNumber); break; }
         }
       }
+      if (conflicts.length) {
+        alert(`Cannot add blocks. Overlaps on courts: ${[...new Set(conflicts)].sort((a,b)=>a-b).join(', ')}`);
+        return;
+      }
+
+      // Preserve additional properties from original block
+      for (const nb of newBlocks) {
+        nb.id = block.id || Date.now() + Math.random();
+        nb.title = block.title; // Preserve the custom title
+        nb.isEvent = block.isEvent;
+        nb.eventDetails = block.eventDetails;
+        nb.createdAt = new Date().toISOString();
+      }
+
+      const next = existing.concat(newBlocks);
+      Storage.writeJSON(key, next);
+      Events.emitDom('tennisDataUpdate', { key, data: next }); // notify other pages
+      console.log('[Admin] wrote blocks:', newBlocks);
+
+      successCount += newBlocks.length;
     }
 
-    window.dispatchEvent(new Event(TENNIS_CONFIG.STORAGE.UPDATE_EVENT));
     showNotification(`Applied ${successCount} block(s) successfully`, 'success');
   };
 
@@ -7079,5 +7167,58 @@ const AnalyticsDashboard = ({ onClose }) => {
       root.render(<TestMenu />);
     } // This closes the initializeApp function
   </script>
+
+  <!-- Debug Panel - Only visible when ?debug=1 -->
+  <script>
+  (function() {
+    const params = new URLSearchParams(location.search);
+    if (params.get('debug') !== '1') return;
+
+    const debugPanel = document.createElement('div');
+    debugPanel.style.cssText = `
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      width: 320px;
+      max-height: 400px;
+      background: rgba(0, 0, 0, 0.85);
+      color: #0f0;
+      font-family: 'Courier New', monospace;
+      font-size: 11px;
+      padding: 10px;
+      border-radius: 4px;
+      overflow-y: auto;
+      z-index: 99999;
+      pointer-events: none;
+      border: 1px solid #0f0;
+    `;
+    debugPanel.innerHTML = '<div style="color: #ff0; margin-bottom: 5px;">DEBUG MODE - Events Log</div><div id="debugContent"></div>';
+    document.body.appendChild(debugPanel);
+
+    const updateDebugPanel = () => {
+      if (!window.Tennis || !window.Tennis.Events || !window.Tennis.Events.debug) return;
+      
+      const events = window.Tennis.Events.debug.getLog();
+      const content = document.getElementById('debugContent');
+      if (!content) return;
+
+      content.innerHTML = events.map((event, i) => {
+        const time = new Date(event.timestamp).toLocaleTimeString();
+        return `<div style="margin-bottom: 5px; padding-bottom: 5px; border-bottom: 1px solid #333;">
+          <div style="color: #ff0;">[${time}] ${event.type}</div>
+          <div style="color: #0ff;">${event.eventName}</div>
+          ${event.data ? `<div style="color: #fff; font-size: 10px;">${JSON.stringify(event.data, null, 2)}</div>` : ''}
+        </div>`;
+      }).join('');
+    };
+
+    // Update every 500ms
+    setInterval(updateDebugPanel, 500);
+    
+    // Initial update
+    setTimeout(updateDebugPanel, 100);
+  })();
+  </script>
+
 </body>
 </html>

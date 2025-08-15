@@ -1,0 +1,114 @@
+(function() {
+  'use strict';
+
+  // Ensure window.Tennis namespace exists
+  window.Tennis = window.Tennis || {};
+
+  // DataStore class with caching for localStorage
+  class TennisDataStore {
+    constructor() {
+      this.cache = new Map();
+      this.metrics = {
+        cacheHits: 0,
+        cacheMisses: 0,
+        totalOperations: 0,
+        totalResponseTime: 0,
+        storageOperationsSaved: 0
+      };
+      this.warmCache();
+    }
+
+    warmCache() {
+      // Pre-load common keys into cache
+      const keys = [
+        'tennisClubData',
+        'tennisClubSettings',
+        'courtBlocks',
+        'tennisDataUpdateTick'
+      ];
+      
+      keys.forEach(key => {
+        const raw = localStorage.getItem(key);
+        if (!raw) return;
+        try {
+          this.cache.set(key, JSON.parse(raw));
+        } catch {}
+      });
+    }
+
+    async get(key) {
+      const t0 = performance.now();
+      this.metrics.totalOperations++;
+      
+      if (this.cache.has(key)) {
+        this.metrics.cacheHits++;
+        this.metrics.totalResponseTime += (performance.now() - t0);
+        return this.cache.get(key);
+      }
+      
+      this.metrics.cacheMisses++;
+      const raw = localStorage.getItem(key);
+      let parsed = null;
+      
+      if (raw) {
+        try {
+          parsed = JSON.parse(raw);
+          this.cache.set(key, parsed);
+        } catch {}
+      }
+      
+      this.metrics.totalResponseTime += (performance.now() - t0);
+      return parsed;
+    }
+
+    async set(key, data, options = {}) {
+      const t0 = performance.now();
+      this.metrics.totalOperations++;
+      
+      // Update cache
+      this.cache.set(key, data);
+      
+      // Write to localStorage
+      if (options.immediate || key === 'tennisClubData' || key === 'courtBlocks') {
+        try {
+          localStorage.setItem(key, JSON.stringify(data));
+        } catch {}
+      }
+      
+      this.metrics.totalResponseTime += (performance.now() - t0);
+      
+      // Emit legacy DOM event for backward compatibility
+      try {
+        window.dispatchEvent(new CustomEvent('tennisDataUpdate', {
+          detail: { key, data }
+        }));
+      } catch {}
+      
+      // Emit new Tennis.Events event
+      if (window.Tennis && window.Tennis.Events && window.Tennis.Events.emitDom) {
+        window.Tennis.Events.emitDom('DATA_UPDATED', { key, data });
+      }
+    }
+
+    getMetrics() {
+      const total = this.metrics.totalOperations || 1;
+      const avg = this.metrics.totalResponseTime / total;
+      const hit = (this.metrics.cacheHits / total) * 100;
+      
+      return {
+        ...this.metrics,
+        avgResponseTime: +avg.toFixed(3),
+        cacheHitRate: +hit.toFixed(1)
+      };
+    }
+
+    clearCache() {
+      this.cache.clear();
+      this.warmCache();
+    }
+  }
+
+  // Create and expose a singleton instance
+  window.Tennis.DataStore = new TennisDataStore();
+
+})();

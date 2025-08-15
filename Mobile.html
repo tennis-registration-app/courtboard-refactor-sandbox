@@ -11,6 +11,95 @@
     .overlay{position:absolute;inset:0;display:none;background:rgba(0,0,0,.45);backdrop-filter:blur(6px)}
     .overlay.show{display:block}
   </style>
+  
+  <!-- Shared modules -->
+  <script src="shared/config.js"></script>
+  <script src="shared/storage.js"></script>
+  <script src="shared/events.js"></script>
+  <script src="shared/datastore.js"></script>
+  <script src="domain/time.js"></script>
+  <script src="domain/availability.js"></script>
+  <script src="domain/blocks.js"></script>
+  <script src="domain/wetCourts.js"></script>
+  <script src="domain/waitlist.js"></script>
+  <script src="domain/selfTest.js"></script>
+  
+  <!-- Health check script -->
+  <script>
+    console.log('🏥 Mobile Shell: Running health check...');
+    
+    function checkModuleAvailability() {
+      const modules = [
+        'window.Tennis.Config',
+        'window.Tennis.Storage',
+        'window.Tennis.Events',
+        'window.Tennis.DataStore',
+        'window.Tennis.Domain.Time',
+        'window.Tennis.Domain.Availability',
+        'window.Tennis.Domain.Blocks',
+        'window.Tennis.Domain.WetCourts',
+        'window.Tennis.Domain.Waitlist',
+        'window.Tennis.selfTest'
+      ];
+      
+      const missing = modules.filter(mod => {
+        try {
+          return !eval(mod);
+        } catch {
+          return true;
+        }
+      });
+      
+      if (missing.length === 0) {
+        console.log('✅ All modules loaded successfully');
+        if (window.Tennis.selfTest) {
+          const results = window.Tennis.selfTest.runAll();
+          console.log(`🧪 Self-tests completed: ${results.passed}/${results.total} passed (${Math.round(results.successRate * 100)}%)`);
+        }
+      } else {
+        console.warn('⚠️ Missing modules:', missing);
+      }
+    }
+    
+    // Check iframes when they load
+    (function () {
+      function getRegFrame() {
+        return document.getElementById('iframeReg') || document.getElementById('iframeRegistration');
+      }
+      function getBoardFrame() {
+        return document.getElementById('iframeBoard');
+      }
+      function checkFrame(frameEl) {
+        const f = frameEl;
+        if (!f || !f.contentWindow) return { ok:false, reason: 'iframe missing' };
+        const w = f.contentWindow;
+        const T = w.Tennis || {};
+        const D = (T.Domain || {});
+        return {
+          ok: !!(T.Config && T.Storage && T.Events && T.DataStore && (D.time || D.Time) && (D.availability || D.Availability)),
+          keys: Object.keys(D || {})
+        };
+      }
+      function logHealth() {
+        const reg = checkFrame(getRegFrame());
+        const brd = checkFrame(getBoardFrame());
+        console.log('[Mobile Health] Registration:', reg);
+        console.log('[Mobile Health] Board:', brd);
+      }
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', logHealth);
+      } else {
+        logHealth();
+      }
+      (window.Tennis && window.Tennis.Events && window.Tennis.Events.onDom) &&
+        window.Tennis.Events.onDom('tennisDataUpdate', logHealth);
+    })();
+    
+    // Run checks
+    document.addEventListener('DOMContentLoaded', () => {
+      checkModuleAvailability();
+    });
+  </script>
 </head>
 <body>
   <main class="host">

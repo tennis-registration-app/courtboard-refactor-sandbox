@@ -524,9 +524,34 @@
     })();
   </script>
   
+  <!-- Load shared modules -->
+  <script src="./shared/config.js"></script>
+  <script src="./shared/storage.js"></script>
+  <script src="./shared/events.js"></script>
+  <script src="./shared/datastore.js"></script>
+  <script src="./domain/time.js"></script>
+  <script src="./domain/availability.js"></script>
+  <script src="./domain/waitlist.js"></script>
+  
   <script type="text/babel">
     // Access shared utils (optional convenience)
     const U = window.APP_UTILS || {};
+    
+    // === Shared Core Integration Flags ===
+    const USE_SHARED_CORE   = true;
+    const USE_SHARED_DOMAIN = true;
+    const Config    = window.Tennis.Config;
+    const Storage = window.Tennis.Storage;
+    const Events  = window.Tennis.Events;
+    const A = window.Tennis.Domain.availability || window.Tennis.Domain.Availability;
+    const W = window.Tennis.Domain.waitlist     || window.Tennis.Domain.Waitlist;
+    const T = window.Tennis.Domain.time         || window.Tennis.Domain.Time;
+    const DataStore = window.Tennis.DataStore;
+    const USE_SHARED_DOMAIN_WAITLIST = true;
+    const Av        = window.Tennis.Domain.availability || window.Tennis.Domain.Availability;
+    const Tm        = window.Tennis.Domain.time         || window.Tennis.Domain.Time;
+    const TimeFmt   = (window.Tennis.Domain.time || window.Tennis.Domain.Time);
+    
     // --- One-time guard helper (no UI change)
     const _one = (key) => (window[key] ? true : (window[key] = true, false));
     
@@ -972,75 +997,44 @@
       // STEP 6: Waiting List Component (from original)
       const WaitingList = ({ waitingGroups, courts, currentTime }) => {
         const calculateEstimatedWaitTimeV2 = (position) => {
-          log.debug(`Calculating wait time for position ${position}`);
+          const DEBUG = false;
+          if (DEBUG) log.debug(`Calculating wait time for position ${position}`);
           
-          const availabilitySlots = [];
-          
-          courts.forEach((court, index) => {
-            const courtNumber = index + 1;
-            let nextAvailableTime = currentTime.getTime();
-            
-            // Check if court has players (new or old structure)
-            if (court?.current?.endTime) {
-              const sessionEndTime = new Date(court.current.endTime).getTime();
-              nextAvailableTime = Math.max(nextAvailableTime, sessionEndTime);
-            } else if (court?.endTime) {
-              const sessionEndTime = new Date(court.endTime).getTime();
-              nextAvailableTime = Math.max(nextAvailableTime, sessionEndTime);
-            }
-            
-            // Check for court blocks
-            try {
-              let courtBlocks = [];
-              try { courtBlocks = JSON.parse(localStorage.getItem('courtBlocks') || '[]'); }
-              catch { /* transient partial write; use empty array */ }
-              const activeBlocks = courtBlocks
-                .filter(block => 
-                  block.courtNumber === courtNumber && 
-                  new Date(block.endTime) > currentTime
-                )
-                .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-              
-              for (const block of activeBlocks) {
-                const blockStart = new Date(block.startTime).getTime();
-                const blockEnd = new Date(block.endTime).getTime();
-                
-                if (blockStart <= nextAvailableTime) {
-                  nextAvailableTime = Math.max(nextAvailableTime, blockEnd);
-                } else {
-                  break;
-                }
-              }
-            } catch (error) {
-              console.error('Error checking blocks for court', courtNumber, error);
-            }
-            
-            availabilitySlots.push(nextAvailableTime);
+          // inputs
+          const now    = new Date();
+          const data   = Storage.readDataSafe();
+          const blocks = Storage.readJSON(Storage.STORAGE.BLOCKS) || [];
+
+          // derive wetSet for current moment (used by free courts; not needed for nextTimes)
+          const wetSet = new Set(
+            blocks
+              .filter(b => b?.isWetCourt && new Date(b.startTime) <= now && new Date(b.endTime) > now)
+              .map(b => b.courtNumber)
+          );
+
+          // domain availability snapshots
+          const info      = A.getFreeCourtsInfo({ data, now, blocks, wetSet });
+          const nextTimes = A.getNextFreeTimes({ data, now, blocks });
+
+          // how many positions your UI renders (keep current value, e.g. 4)
+          const positions = [position];
+
+          // domain ETA (minutes, rounded up)
+          const etas = W.estimateWaitForPositions({
+            positions,
+            currentFreeCount: info.free.length,
+            nextFreeTimes: nextTimes,
+            avgGameMinutes: window.Tennis.Config.Timing.AVG_GAME
           });
+
+          // If your UI expects absolute times, you can derive them from `now + minutes`
+          // const etaTimes  = etas.map(m => new Date(now.getTime() + m * 60000));
+          // const etaLabels = etaTimes.map(d => T?.formatTime ? T.formatTime(d) : d.toLocaleTimeString());
+
+          // Use `etas` (or `etaLabels`, depending on what the existing UI expects)
+          // Replace the previous variables that fed the DOM update with these values.
           
-          // Sort slots by availability time
-          availabilitySlots.sort((a, b) => a - b);
-          
-          log.debug(`Court availability slots:`, availabilitySlots.map(slot => 
-            new Date(slot).toLocaleTimeString()
-          ));
-          
-          // Calculate wait time based on position
-          if (position <= availabilitySlots.length) {
-            const waitMinutes = Math.ceil((availabilitySlots[position - 1] - currentTime.getTime()) / 60000);
-            // console.log(`Position ${position} wait time: ${waitMinutes} minutes`);
-            return Math.max(0, waitMinutes);
-          }
-          
-          // Fallback for positions beyond available slots
-          const rounds = Math.ceil(position / courts.length);
-          if (availabilitySlots.length > 0) {
-            let waitTime = Math.ceil((availabilitySlots[0] - currentTime.getTime()) / 60000);
-            waitTime += (rounds - 1) * TENNIS_CONFIG.TIMING.AVG_GAME_TIME_MIN;
-            return Math.max(0, waitTime);
-          }
-          
-          return Math.max(0, (position - 1) * 15); // 15 min fallback
+          return etas[0] || 0;
         };
 
         return (
@@ -1322,6 +1316,39 @@
           
 
         const hasEmptyCourts = () => {
+          if (USE_SHARED_DOMAIN && A && A.getFreeCourts) {
+            try {
+              // Build a set of wet courts from active wet-court blocks
+              const now = new Date();
+              const data = Storage.readDataSafe();
+              const blocks = Storage.readJSON(
+                (Storage.STORAGE && Storage.STORAGE.BLOCKS) ||
+                (APP_UTILS && APP_UTILS.STORAGE && APP_UTILS.STORAGE.BLOCKS) ||
+                'courtBlocks'
+              ) || [];
+
+              const wetSet = new Set(
+                blocks
+                  .filter(b =>
+                    b && b.isWetCourt === true &&
+                    new Date(b.startTime) <= now &&
+                    new Date(b.endTime) >  now
+                  )
+                  .map(b => b.courtNumber)
+              );
+
+              // Compute free courts honoring wet courts + blocks
+              const info = A.getFreeCourtsInfo({ data, now, blocks, wetSet });
+              const free = info.free;            // use for "Available Now"
+              // (occupied available if needed later): const occupied = info.occupied;
+              
+              return free.length > 0;
+            } catch (error) {
+              console.error('Error calling A.getFreeCourts:', error);
+            }
+          }
+          
+          // Legacy logic (kept for fallback)
           if (!courts || !Array.isArray(courts)) return false;
           
           // Get current blocks from localStorage
@@ -1701,6 +1728,14 @@
 
           window.addEventListener(TENNIS_CONFIG.STORAGE.UPDATE_EVENT, handleUpdate, { passive: true });
           
+          // Shared Events subscription for availability updates
+          if (USE_SHARED_CORE && Events) {
+            Events.onDom('tennisDataUpdate', () => {
+              // recompute with A.getFreeCourts(...) and re-render
+              loadData();
+            });
+          }
+          
           // Increased polling frequency for immediate updates
           const interval = addTimer(setInterval(loadData, CONSTANTS.POLL_INTERVAL_MS));
 
@@ -1987,5 +2022,58 @@
       // console.log('✅ DataStore integrated Tennis Display loaded with full original styling!');
     }
   </script>
+
+  <!-- Debug Panel - Only visible when ?debug=1 -->
+  <script>
+  (function() {
+    const params = new URLSearchParams(location.search);
+    if (params.get('debug') !== '1') return;
+
+    const debugPanel = document.createElement('div');
+    debugPanel.style.cssText = `
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      width: 320px;
+      max-height: 400px;
+      background: rgba(0, 0, 0, 0.85);
+      color: #0f0;
+      font-family: 'Courier New', monospace;
+      font-size: 11px;
+      padding: 10px;
+      border-radius: 4px;
+      overflow-y: auto;
+      z-index: 99999;
+      pointer-events: none;
+      border: 1px solid #0f0;
+    `;
+    debugPanel.innerHTML = '<div style="color: #ff0; margin-bottom: 5px;">DEBUG MODE - Events Log</div><div id="debugContent"></div>';
+    document.body.appendChild(debugPanel);
+
+    const updateDebugPanel = () => {
+      if (!window.Tennis || !window.Tennis.Events || !window.Tennis.Events.debug) return;
+      
+      const events = window.Tennis.Events.debug.getLog();
+      const content = document.getElementById('debugContent');
+      if (!content) return;
+
+      content.innerHTML = events.map((event, i) => {
+        const time = new Date(event.timestamp).toLocaleTimeString();
+        return `<div style="margin-bottom: 5px; padding-bottom: 5px; border-bottom: 1px solid #333;">
+          <div style="color: #ff0;">[${time}] ${event.type}</div>
+          <div style="color: #0ff;">${event.eventName}</div>
+          ${event.data ? `<div style="color: #fff; font-size: 10px;">${JSON.stringify(event.data, null, 2)}</div>` : ''}
+        </div>`;
+      }).join('');
+    };
+
+    // Update every 500ms
+    setInterval(updateDebugPanel, 500);
+    
+    // Initial update
+    setTimeout(updateDebugPanel, 100);
+  })();
+  </script>
+
 </body>
 </html>
