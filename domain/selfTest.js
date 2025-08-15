@@ -344,6 +344,87 @@
           console.groupEnd();
         }
 
+        // Test Selection Policy
+        if (window.Tennis.Domain && window.Tennis.Domain.Availability && window.Tennis.Domain.Availability.getSelectableCourts) {
+          console.group('🎯 Selection Policy Tests');
+          const Av = window.Tennis.Domain.availability || window.Tennis.Domain.Availability;
+          const now = new Date();
+          
+          // Case A: free exists - Courts: 1 idle, others in-progress → expect selectable = [1] (free only)
+          const freeExistsData = {
+            courts: [
+              { current: undefined }, // Court 1: idle (free)
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p1', name: 'Player 1' }] } }, // Court 2: in-progress
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p2', name: 'Player 2' }] } }, // Court 3: in-progress
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p3', name: 'Player 3' }] } }  // Court 4: in-progress
+            ]
+          };
+          const selectableA = Av.getSelectableCourts({ data: freeExistsData, now: now, blocks: [], wetSet: new Set() });
+          const infoA = Av.getFreeCourtsInfo({ data: freeExistsData, now: now, blocks: [], wetSet: new Set() });
+          assert(selectableA.length === 1 && selectableA.includes(1), 'Case A: When free courts exist, returns only free courts');
+          assert(infoA.overtime.length === 0, 'Case A: No overtime courts when games are in progress');
+          
+          // Case B: no free, overtime exists - Courts: all in overtime except 1 in-progress → expect selectable = [overtime courts]
+          const overtimeExistsData = {
+            courts: [
+              { current: { endTime: new Date(now.getTime() - 5 * 60 * 1000).toISOString(), players: [{ id: 'p1', name: 'Player 1' }] } }, // Court 1: overtime
+              { current: { endTime: new Date(now.getTime() - 5 * 60 * 1000).toISOString(), players: [{ id: 'p2', name: 'Player 2' }] } }, // Court 2: overtime
+              { current: { endTime: new Date(now.getTime() - 5 * 60 * 1000).toISOString(), players: [{ id: 'p3', name: 'Player 3' }] } }, // Court 3: overtime
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p4', name: 'Player 4' }] } }  // Court 4: in-progress
+            ]
+          };
+          const selectableB = Av.getSelectableCourts({ data: overtimeExistsData, now: now, blocks: [], wetSet: new Set() });
+          const infoB = Av.getFreeCourtsInfo({ data: overtimeExistsData, now: now, blocks: [], wetSet: new Set() });
+          assert(selectableB.length === 3 && selectableB.includes(1) && selectableB.includes(2) && selectableB.includes(3), 'Case B: When no free courts, returns overtime courts');
+          assert(infoB.free.length === 0, 'Case B: No free courts available');
+          
+          // Case C: wet excluded - Courts: 1 idle but wet, 2 idle and not wet, others in-progress → expect selectable = [2]
+          const wetExcludedData = {
+            courts: [
+              { current: undefined }, // Court 1: idle but will be wet
+              { current: undefined }, // Court 2: idle and not wet
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p1', name: 'Player 1' }] } }, // Court 3: in-progress
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p2', name: 'Player 2' }] } }  // Court 4: in-progress
+            ]
+          };
+          const wetSet = new Set([1]); // Court 1 is wet
+          const selectableC = Av.getSelectableCourts({ data: wetExcludedData, now: now, blocks: [], wetSet: wetSet });
+          assert(selectableC.length === 1 && selectableC.includes(2) && !selectableC.includes(1), 'Case C: Wet courts are excluded from selection');
+          
+          // Case D: blocked excluded - Courts: 1 idle but blocked, 2 idle and not blocked, others in-progress → expect selectable = [2]
+          const blockedExcludedData = {
+            courts: [
+              { current: undefined }, // Court 1: idle but will be blocked
+              { current: undefined }, // Court 2: idle and not blocked
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p1', name: 'Player 1' }] } }, // Court 3: in-progress
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p2', name: 'Player 2' }] } }  // Court 4: in-progress
+            ]
+          };
+          const blocks = [{
+            courtNumber: 1,
+            startTime: new Date(now.getTime() - 5 * 60 * 1000).toISOString(),
+            endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+            isWetCourt: false
+          }];
+          const selectableD = Av.getSelectableCourts({ data: blockedExcludedData, now: now, blocks: blocks, wetSet: new Set() });
+          assert(selectableD.length === 1 && selectableD.includes(2) && !selectableD.includes(1), 'Case D: Blocked courts are excluded from selection');
+          
+          // Case E: fallback to overtime with exclusions - Courts: no free; overtime [1,2], but 2 is wet → expect selectable = [1]
+          const overtimeWithExclusionsData = {
+            courts: [
+              { current: { endTime: new Date(now.getTime() - 5 * 60 * 1000).toISOString(), players: [{ id: 'p1', name: 'Player 1' }] } }, // Court 1: overtime
+              { current: { endTime: new Date(now.getTime() - 5 * 60 * 1000).toISOString(), players: [{ id: 'p2', name: 'Player 2' }] } }, // Court 2: overtime but wet
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p3', name: 'Player 3' }] } }, // Court 3: in-progress
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p4', name: 'Player 4' }] } }  // Court 4: in-progress
+            ]
+          };
+          const wetSetE = new Set([2]); // Court 2 is wet
+          const selectableE = Av.getSelectableCourts({ data: overtimeWithExclusionsData, now: now, blocks: [], wetSet: wetSetE });
+          assert(selectableE.length === 1 && selectableE.includes(1) && !selectableE.includes(2), 'Case E: Wet overtime courts are excluded, returns only available overtime');
+          
+          console.groupEnd();
+        }
+
       } catch (error) {
         console.error('❌ Error during self-tests:', error);
         failedTests++;
