@@ -425,6 +425,82 @@
           console.groupEnd();
         }
 
+        // Test Court Statuses
+        if (window.Tennis.Domain && window.Tennis.Domain.Availability && window.Tennis.Domain.Availability.getCourtStatuses) {
+          console.group('🏛️ Court Statuses Tests');
+          const Availability = window.Tennis.Domain.Availability;
+          const now = new Date();
+          
+          // Test 1: With one truly free court → that court's status === 'free' and selectable === true
+          const oneFreeData = {
+            courts: [
+              { current: undefined }, // Court 1: free
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p1', name: 'Player 1' }] } }, // Court 2: occupied
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p2', name: 'Player 2' }] } }, // Court 3: occupied
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p3', name: 'Player 3' }] } }  // Court 4: occupied
+            ]
+          };
+          const statuses1 = Availability.getCourtStatuses({ data: oneFreeData, now: now, blocks: [], wetSet: new Set() });
+          const court1 = statuses1.find(s => s.courtNumber === 1);
+          const court2 = statuses1.find(s => s.courtNumber === 2);
+          assert(court1.status === 'free' && court1.selectable === true, 'Free court has status "free" and selectable true');
+          assert(court2.status === 'occupied' && court2.selectable === false, 'Occupied court has status "occupied" and selectable false');
+          
+          // Test 2: With no free, two overtime → both have status === 'overtime' and selectable === true
+          const overtimeData = {
+            courts: [
+              { current: { endTime: new Date(now.getTime() - 5 * 60 * 1000).toISOString(), players: [{ id: 'p1', name: 'Player 1' }] } }, // Court 1: overtime
+              { current: { endTime: new Date(now.getTime() - 5 * 60 * 1000).toISOString(), players: [{ id: 'p2', name: 'Player 2' }] } }, // Court 2: overtime
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p3', name: 'Player 3' }] } }, // Court 3: occupied
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p4', name: 'Player 4' }] } }  // Court 4: occupied
+            ]
+          };
+          const statuses2 = Availability.getCourtStatuses({ data: overtimeData, now: now, blocks: [], wetSet: new Set() });
+          const overtime1 = statuses2.find(s => s.courtNumber === 1);
+          const overtime2 = statuses2.find(s => s.courtNumber === 2);
+          assert(overtime1.status === 'overtime' && overtime1.selectable === true, 'Overtime court has status "overtime" and selectable true when no free courts');
+          assert(overtime2.status === 'overtime' && overtime2.selectable === true, 'Second overtime court also selectable when no free courts');
+          
+          // Test 3: Wet court has selectable === false and status 'wet'
+          const wetData = {
+            courts: [
+              { current: undefined }, // Court 1: would be free but wet
+              { current: undefined }, // Court 2: free
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p1', name: 'Player 1' }] } }, // Court 3: occupied
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p2', name: 'Player 2' }] } }  // Court 4: occupied
+            ]
+          };
+          const wetSet = new Set([1]);
+          const statuses3 = Availability.getCourtStatuses({ data: wetData, now: now, blocks: [], wetSet: wetSet });
+          const wetCourt = statuses3.find(s => s.courtNumber === 1);
+          const freeCourt = statuses3.find(s => s.courtNumber === 2);
+          assert(wetCourt.status === 'wet' && wetCourt.selectable === false, 'Wet court has status "wet" and selectable false');
+          assert(freeCourt.status === 'free' && freeCourt.selectable === true, 'Non-wet free court remains selectable');
+          
+          // Test 4: Blocked court has selectable === false and status 'blocked'
+          const blockedData = {
+            courts: [
+              { current: undefined }, // Court 1: would be free but blocked
+              { current: undefined }, // Court 2: free
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p1', name: 'Player 1' }] } }, // Court 3: occupied
+              { current: { endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), players: [{ id: 'p2', name: 'Player 2' }] } }  // Court 4: occupied
+            ]
+          };
+          const blocks = [{
+            courtNumber: 1,
+            startTime: new Date(now.getTime() - 5 * 60 * 1000).toISOString(),
+            endTime: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+            isWetCourt: false
+          }];
+          const statuses4 = Availability.getCourtStatuses({ data: blockedData, now: now, blocks: blocks, wetSet: new Set() });
+          const blockedCourt = statuses4.find(s => s.courtNumber === 1);
+          const freeCourt2 = statuses4.find(s => s.courtNumber === 2);
+          assert(blockedCourt.status === 'blocked' && blockedCourt.selectable === false, 'Blocked court has status "blocked" and selectable false');
+          assert(freeCourt2.status === 'free' && freeCourt2.selectable === true, 'Non-blocked free court remains selectable');
+          
+          console.groupEnd();
+        }
+
       } catch (error) {
         console.error('❌ Error during self-tests:', error);
         failedTests++;

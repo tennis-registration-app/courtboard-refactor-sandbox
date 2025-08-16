@@ -68,7 +68,29 @@
       // Update cache
       this.cache.set(key, data);
       
-      // Write to localStorage
+      // Special handling for tennisClubData to use Storage.writeJSON
+      const S = window.Tennis?.Storage;
+      const E = window.Tennis?.Events;
+      const DATA_KEY = S?.STORAGE?.DATA;
+      const TICK_KEY = S?.STORAGE?.UPDATE_TICK;
+      
+      if (key === DATA_KEY && S?.writeJSON) {
+        const persisted = data;
+        try {
+          // monotonic tick for freshness (lightweight)
+          S.writeJSON(TICK_KEY, Date.now());
+          // use guarded write path (StorageGuard will prevent clobbering)
+          S.writeJSON(DATA_KEY, persisted);
+        } finally {
+          // emit both events for compatibility
+          E?.emitDom?.('DATA_UPDATED', { key: DATA_KEY, data: persisted });
+          E?.emitDom?.('tennisDataUpdate', { key: DATA_KEY, data: persisted });
+        }
+        this.metrics.totalResponseTime += (performance.now() - t0);
+        return persisted;
+      }
+      
+      // Fallback: existing behavior for non-DATA keys
       if (options.immediate || key === 'tennisClubData' || key === 'courtBlocks') {
         try {
           localStorage.setItem(key, JSON.stringify(data));

@@ -20,9 +20,12 @@
   <script src="./shared/storage.js"></script>
   <script src="./shared/events.js"></script>
   <script src="./shared/datastore.js"></script>
+  <script src="./shared/maintenance.js"></script>
+  <script src="./shared/dataservice.js"></script>
   <script src="./domain/time.js"></script>
   <script src="./domain/blocks.js"></script>
   <script src="./domain/wetCourts.js"></script>
+  <script src="./domain/availability.js"></script>
   <!-- Preflight self-heal (normalize storage shape before app code runs) -->
   <script>try{ window.APP_UTILS && window.APP_UTILS.readDataSafe(); }catch(e){}</script>
   
@@ -35,6 +38,21 @@
    const U = window.APP_UTILS || {};
    // --- One-time guard helper (no UI change)
    const _one = (key) => (window[key] ? true : (window[key] = true, false));
+   
+   // Coalesce multiple data events into a single refresh
+   let __adminRefreshPending = false;
+   function scheduleAdminRefresh() {
+     if (__adminRefreshPending) return;
+     __adminRefreshPending = true;
+     setTimeout(() => {
+       __adminRefreshPending = false;
+       const fn = window.refreshAdminView || (() => window.dispatchEvent(new Event('ADMIN_REFRESH')));
+       fn();
+     }, 0);
+   }
+
+   // global fallback bridge (safe if re-run)
+   window.refreshAdminView = window.refreshAdminView || (() => window.dispatchEvent(new Event('ADMIN_REFRESH')));
    
    // Shared domain modules
    const USE_SHARED_DOMAIN = true;
@@ -591,6 +609,17 @@ const CourtStatusGrid = ({ courts, courtBlocks, selectedDate, onClearCourt, onMo
   const [editingBlock, setEditingBlock] = useState(null);
   const [localWetCourts, setLocalWetCourts] = useState(new Set());
   const [refreshKey, setRefreshKey] = useState(0);
+  const [refreshTick, setRefreshTick] = useState(0);
+
+  React.useEffect(() => {
+    const onUpdate = () => setRefreshTick(t => t + 1);
+    document.addEventListener('DATA_UPDATED', onUpdate);
+    document.addEventListener('tennisDataUpdate', onUpdate);
+    return () => {
+      document.removeEventListener('DATA_UPDATED', onUpdate);
+      document.removeEventListener('tennisDataUpdate', onUpdate);
+    };
+  }, []);
 
   // Load wet court status on mount and poll for updates
   useEffect(() => {
@@ -856,6 +885,18 @@ const handleAllCourtsDry = async () => {
 
   // ... (keep the handleSaveGame and handleSaveBlock functions as they are)
 
+  // where the grid computes rows:
+  const S = window.Tennis?.Storage;
+  const data = S.readDataSafe(); // this will re-run on each re-render
+  // if you compute occupied/free, use domain:
+  const A = window.Tennis?.Domain?.availability || window.Tennis?.Domain?.Availability;
+  const now = new Date();
+  const blocks = S.readJSON(S.STORAGE?.BLOCKS) || [];
+  const wetSet = new Set((blocks||[])
+    .filter(b => b?.isWetCourt && new Date(b.startTime ?? b.start) <= now && now < new Date(b.endTime ?? b.end))
+    .map(b => b.courtNumber));
+  const statuses = A.getCourtStatuses({ data, now, blocks, wetSet });
+
   return (
     <>
       <div className="bg-white rounded-lg shadow-sm p-4">
@@ -880,7 +921,7 @@ const handleAllCourtsDry = async () => {
         
         <div className="grid grid-cols-3 gap-3">
           {Array.from({ length: 12 }, (_, index) => {
-            const court = courts[index] || null;
+            const court = data?.courts?.[index] || null;
             const courtNum = index + 1;
             const { status, info } = getCourtStatus(court, courtNum);
             const isMoving = movingFrom === courtNum;
@@ -4690,7 +4731,7 @@ const MockAIAdmin = ({ onClose, dataStore, courts, loadData, clearCourt, clearAl
         }
 
         const template = { name, reason, duration: Number(durationMinutes), courts: selectedCourts };
-        const now = new Date();
+        // const now = new Date(); // Already declared at line 4665
 
         // domain: build blocks (one per court)
         const newBlocks = BL.applyTemplate({ template, now }); // <-- correct call shape
@@ -4738,10 +4779,13 @@ const MockAIAdmin = ({ onClose, dataStore, courts, loadData, clearCourt, clearAl
         return '✓ All courts cleared';
         
       case 'clearWaitlist':
-        // Clear waitlist from dataStore
-        const currentData = await dataStore.get('tennisClubData') || {};
-        currentData.waitingGroups = [];
-        await dataStore.set('tennisClubData', currentData, { immediate: true });
+        // Clear waitlist via service
+        const TD = window.TennisDataService || window.Tennis?.DataService || window.Tennis?.Services?.Data;
+        if (typeof TD?.clearWaitlist === 'function') {
+          await TD.clearWaitlist({ source: 'admin' });
+        } else {
+          throw new Error('No clearWaitlist service available');
+        }
         refreshData();
         return '✓ Waitlist cleared';
         
@@ -5310,6 +5354,7 @@ const deactivateWetCourts = () => {
 
   // Load data from localStorage
   const loadData = useCallback(async () => {
+    window.refreshAdminView = loadData; // expose for coalescer & tests
     try {
       // Load court data
       const courtData = await dataStore.get(TENNIS_CONFIG.STORAGE.KEY);
@@ -5333,6 +5378,13 @@ const deactivateWetCourts = () => {
       console.error('Failed to load data:', error);
       onNotification('Failed to load data', 'error');
     }
+  }, []);
+  
+  // Event-driven refresh bridge listener
+  React.useEffect(() => {
+    const onAdminRefresh = () => { loadData(); };
+    window.addEventListener('ADMIN_REFRESH', onAdminRefresh);
+    return () => window.removeEventListener('ADMIN_REFRESH', onAdminRefresh);
   }, []);
 
   // Save data to localStorage
@@ -5373,10 +5425,8 @@ const deactivateWetCourts = () => {
       loadData();
     }, 2000));
     
-    const handleStorageUpdate = debounce(() => {
-      console.log('Storage update event received');
-      loadData();
-    }, 150);
+    // Use coalesced refresh instead of direct handler
+    const handleStorageUpdate = scheduleAdminRefresh;
 
     // Listen for storage events from other apps/tabs
     const handleStorageEvent = (e) => {
@@ -5388,19 +5438,22 @@ const deactivateWetCourts = () => {
       }
     };
     
-    window.addEventListener(TENNIS_CONFIG.STORAGE.UPDATE_EVENT, handleStorageUpdate, { passive: true });
+    window.addEventListener('tennisDataUpdate', scheduleAdminRefresh, { passive: true });
+    window.addEventListener('DATA_UPDATED', scheduleAdminRefresh, { passive: true });
     window.addEventListener('storage', handleStorageEvent, { passive: true });
     
     // defensive cleanup on unload as well
     window.addEventListener('beforeunload', () => {
       try { clearAllTimers(); } catch {}
-      try { window.removeEventListener(TENNIS_CONFIG.STORAGE.UPDATE_EVENT, handleStorageUpdate); } catch {}
+      try { window.removeEventListener('tennisDataUpdate', scheduleAdminRefresh); } catch {}
+      try { window.removeEventListener('DATA_UPDATED', scheduleAdminRefresh); } catch {}
       try { window.removeEventListener('storage', handleStorageEvent); } catch {}
     }, { once: true });
     
     return () => {
       try { clearInterval(pollInterval); } catch {}
-      try { window.removeEventListener(TENNIS_CONFIG.STORAGE.UPDATE_EVENT, handleStorageUpdate); } catch {}
+      try { window.removeEventListener('tennisDataUpdate', scheduleAdminRefresh); } catch {}
+      try { window.removeEventListener('DATA_UPDATED', scheduleAdminRefresh); } catch {}
       try { window.removeEventListener('storage', handleStorageEvent); } catch {}
     };
   }, [loadData]);
@@ -5460,53 +5513,17 @@ useEffect(() => {
 
   // Court operations
   const clearCourt = async (courtNumber) => {
-  // Use the proper iPad app clearing method that preserves history
+  // Use TennisDataService API which handles history preservation
   try {
-    const data = await dataStore.get('tennisClubData');
-    if (data) {
-      const court = data.courts[courtNumber - 1];
-      
-      if (court && ((court.current && court.current.players) || court.players)) {
-        // Clear using the same logic as iPad app's manual clear
-        const currentTime = new Date();
-        const players = court.current?.players || court.players;
-        const startTime = court.current?.startTime || court.startTime;
-        const endTime = court.current?.endTime || court.endTime;
-        
-        // Add to recently cleared for history preservation
-        if (!data.recentlyCleared) data.recentlyCleared = [];
-        
-        if (endTime && new Date(endTime) > currentTime) {
-          data.recentlyCleared.push({
-            players: players,
-            originalEndTime: endTime,
-            clearedAt: currentTime.toISOString(),
-            courtNumber: courtNumber
-          });
-        }
-        
-        // Create historical record instead of wiping
-        data.courts[courtNumber - 1] = {
-          ...court,
-          current: null,
-          players: null,
-          history: [
-            ...(court.history || []),
-            {
-              players: players,
-              startTime: startTime,
-              actualEndTime: currentTime.toISOString(),
-              endReason: 'admin_cleared',
-              duration: court.duration
-            }
-          ]
-        };
-        
-        await dataStore.set('tennisClubData', data, { immediate: true });
-        window.dispatchEvent(new Event('tennisDataUpdate'));
-        loadData(); // Refresh admin display
-      }
+    const TD = window.TennisDataService || window.Tennis?.DataService || window.Tennis?.Services?.Data;
+    if (typeof TD?.clearCourt === 'function') {
+      await TD.clearCourt(courtNumber, { source: 'admin' });
+    } else if (typeof TD?.unassignCourt === 'function') {
+      await TD.unassignCourt(courtNumber, { source: 'admin' });
+    } else {
+      throw new Error('No clearCourt/unassignCourt service available');
     }
+    loadData(); // Refresh admin display
   } catch (error) {
     console.error('Error clearing court:', error);
     showNotification('Failed to clear court', 'error');
@@ -7166,6 +7183,24 @@ const AnalyticsDashboard = ({ onClose }) => {
   const root = ReactDOM.createRoot(document.getElementById('root'));
       root.render(<TestMenu />);
     } // This closes the initializeApp function
+  </script>
+
+  <script>
+    // Final, idempotent export shim (runs after Admin has booted)
+    (function ensureAdminExport() {
+      const candidate =
+        window.refreshAdminView ||
+        window.loadData ||
+        window.refreshData;
+
+      if (typeof candidate === 'function') {
+        window.refreshAdminView = candidate;
+      }
+
+      // quick self-test
+      console.log('[Admin] refreshAdminView exported:',
+        typeof window.refreshAdminView === 'function');
+    })();
   </script>
 
   <!-- Debug Panel - Only visible when ?debug=1 -->

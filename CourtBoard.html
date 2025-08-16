@@ -529,9 +529,51 @@
   <script src="./shared/storage.js"></script>
   <script src="./shared/events.js"></script>
   <script src="./shared/datastore.js"></script>
+  <script src="./shared/maintenance.js"></script>
   <script src="./domain/time.js"></script>
   <script src="./domain/availability.js"></script>
   <script src="./domain/waitlist.js"></script>
+  
+  <script>
+  (function(){
+    // Delegate to shared auto-clear function
+    window.__autoClearOverdueSessions = (when) =>
+      window.Tennis?.Maintenance?.autoClearOverdueSessions?.(when);
+
+    // Run once on boot, then every 5 minutes
+    document.addEventListener('DOMContentLoaded', () => {
+      window.__autoClearOverdueSessions();
+      if (!window.__autoClearInterval) {
+        window.__autoClearInterval = setInterval(() => window.__autoClearOverdueSessions(), 5 * 60 * 1000);
+      }
+    });
+  })();
+  </script>
+  
+  <script>
+  (() => {
+    if (window.__installedAutoClear) return;
+    window.__installedAutoClear = true;
+
+    const run = async (reason) => {
+      try {
+        const fn = window.__autoClearOverdueSessions;
+        if (typeof fn !== 'function') return;
+        const n = await fn();
+        if (n > 0 || (window.Tennis?.Config?.Debug?.VERBOSE_AUTO_CLEAR === true)) {
+          console.log(`[AutoClear] ${reason}: cleared ${n} overdue sessions`);
+        }
+      } catch (e) {
+        console.warn('[AutoClear] error', e);
+      }
+    };
+
+    // run once on load
+    run('onload');
+    // run every 5 minutes
+    window.__autoClearInterval = setInterval(() => run('interval'), 5 * 60 * 1000);
+  })();
+  </script>
   
   <script type="text/babel">
     // Access shared utils (optional convenience)
@@ -548,6 +590,21 @@
     const T = window.Tennis.Domain.time         || window.Tennis.Domain.Time;
     const DataStore = window.Tennis.DataStore;
     const USE_SHARED_DOMAIN_WAITLIST = true;
+    
+    // Coalesce multiple data events into a single refresh
+    let __boardRefreshPending = false;
+    function scheduleBoardRefresh() {
+      if (__boardRefreshPending) return;
+      __boardRefreshPending = true;
+      setTimeout(() => {
+        __boardRefreshPending = false;
+        const fn =
+          (typeof window.refreshBoard === 'function' && window.refreshBoard) ||
+          (typeof refreshBoard === 'function' && refreshBoard) ||
+          null;
+        if (fn) fn();
+      }, 0);
+    }
     const Av        = window.Tennis.Domain.availability || window.Tennis.Domain.Availability;
     const Tm        = window.Tennis.Domain.time         || window.Tennis.Domain.Time;
     const TimeFmt   = (window.Tennis.Domain.time || window.Tennis.Domain.Time);
@@ -599,6 +656,42 @@
       return false;
     };
     
+    // Status → Tailwind classes (no color classes outside this map)
+    function classForStatus(status) {
+      switch (status) {
+        case 'occupied':           // blue (in use)
+          return 'bg-gradient-to-b from-blue-400 to-blue-500 border-blue-400';
+        case 'overtime':           // grey (overtime, not selectable)
+          return 'bg-gradient-to-b from-gray-300 to-gray-400 border-gray-300';
+        case 'overtime-available': // dark green (overtime but selectable)
+          return 'bg-gradient-to-b from-emerald-600 to-emerald-700 border-emerald-600';
+        case 'overtimeAvailable':  // dark green (overtime but selectable)
+          return 'bg-gradient-to-b from-green-600 to-green-700 border-green-600';
+        case 'wet':                // grey (or your wet palette)
+        case 'blocked':
+          return 'bg-gradient-to-b from-gray-300 to-gray-400 border-gray-300';
+        case 'free':               // emerald (empty/available)
+        default:
+          return 'bg-gradient-to-b from-emerald-400 to-emerald-500 border-emerald-400';
+      }
+    }
+
+    // Unified status source for the board UI
+    function computeBoardStatuses() {
+      const A = window.Tennis?.Domain?.availability || window.Tennis?.Domain?.Availability;
+      const S = window.Tennis?.Storage;
+      const now = new Date();
+      const data = S.readDataSafe();
+      const blocks = S.readJSON(S.STORAGE?.BLOCKS) || [];
+      const wetSet = new Set(
+        (blocks || [])
+          .filter(b => b?.isWetCourt && new Date(b.startTime ?? b.start) <= now && now < new Date(b.endTime ?? b.end))
+          .map(b => b.courtNumber)
+      );
+      const statuses = A.getCourtStatuses({ data, now, blocks, wetSet });
+      return { data, map: Object.fromEntries(statuses.map(s => [s.courtNumber, s])) };
+    }
+    
     // ---- Dev flag & assert (no UI change) ----
     const DEV = (typeof location !== 'undefined') && /localhost|127\.0\.0\.1/.test(location.host);
     const assert = (cond, msg, obj) => { if (DEV && !cond) console.warn('ASSERT:', msg, obj||''); };
@@ -617,6 +710,60 @@
     
     // central registry for timers in this view
     const _timers = [];
+    
+    // ---- Helpers for domain-based tile text ----
+    function namesFor(courtObj) {
+      if (Array.isArray(courtObj?.current?.players)) {
+        return courtObj.current.players.map(p => p?.name).filter(Boolean).join(', ');
+      }
+      // fallback: last history entry if current is missing (e.g., older overtime)
+      const last = Array.isArray(courtObj?.history) && courtObj.history.length
+        ? courtObj.history[courtObj.history.length - 1] : null;
+      if (Array.isArray(last?.players)) {
+        return last.players.map(p => p?.name).filter(Boolean).join(', ');
+      }
+      return '';
+    }
+
+    function labelFor(status, courtObj) {
+      if (status === 'occupied') {
+        const end = courtObj?.current?.endTime ? new Date(courtObj.current.endTime) : null;
+        const until = end ? `Until ${end.toLocaleTimeString([], { hour:'numeric', minute:'2-digit' })}` : '';
+        const nm = namesFor(courtObj);
+        // Your board already renders mins elsewhere; keep it as-is. Just ensure not "Available".
+        return nm ? `${nm}${until ? '\n' + until : ''}` : until || '';
+      }
+      if (status === 'overtime') {
+        const nm = namesFor(courtObj);
+        // Explicitly "Overtime" + names; never "Available".
+        return nm ? `Overtime\n${nm}` : 'Overtime';
+      }
+      // free, wet, blocked etc.
+      if (status === 'free') return 'Available';
+      if (status === 'wet') return 'Wet';
+      if (status === 'blocked') return 'Blocked';
+      return '';
+    }
+
+    function computeClock(status, courtObj, now) {
+      if (status === 'occupied') {
+        const end = courtObj?.current?.endTime ? new Date(courtObj.current.endTime) : null;
+        if (end && end > now) {
+          const mins = Math.max(0, Math.ceil((end - now) / 60000));
+          return {
+            primary: `${mins} min`,
+            secondary: `Until ${end.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`,
+          };
+        }
+        return { primary: 'Overtime', secondary: '' };
+      }
+      if (status === 'overtime') return { primary: 'Overtime', secondary: '' };
+      if (status === 'free')     return { primary: 'Available', secondary: '' };
+      if (status === 'wet')      return { primary: 'Wet', secondary: '' };
+      if (status === 'blocked')  return { primary: 'Blocked', secondary: '' };
+      return { primary: '', secondary: '' };
+    }
+
     const addTimer = (id, type = 'interval') => { _timers.push({ id, type }); return id; };
     const clearAllTimers = () => {
       _timers.forEach(({id, type}) => {
@@ -876,119 +1023,93 @@
       // STEP 5: Court Display Component (from original with DataStore integration)
       const CourtDisplay = ({ 
         courtNumber, 
-        court, 
         currentTime, 
-        hasEmptyCourts,
         timeoutWarningMinutes = 180,
-        formatPlayerName = (name) => name 
+        formatPlayerName = (name) => name,
+        statusByCourt,
+        selectableByCourt,
+        data
       }) => {
 
+        const status = statusByCourt[courtNumber] || 'free';
+        const selectable = selectableByCourt[courtNumber] || false;
+        const cObj    = data?.courts?.[courtNumber - 1] || {};
+        const content = labelFor(status, cObj);
         const blockStatus = getCourtBlockStatus(courtNumber);
-        const isBlocked = blockStatus && blockStatus.isCurrent;
-        
-        const endTime = court?.current?.endTime || court?.endTime;
-        const timeRemaining = court && endTime && !isBlocked
+        const endTime = cObj?.current?.endTime || cObj?.endTime;
+        const timeRemaining = cObj && endTime && status !== 'blocked'
           ? Math.max(0, Math.floor((new Date(endTime).getTime() - currentTime.getTime()) / 60000))
           : 0;
-
-        const isOverdue = court && endTime && new Date(endTime) <= currentTime && !isBlocked;
-
-        const isAvailable = !court || (court && court.current === null);
         let approachingTimeout = false;
-        const startTime = court?.current?.startTime || court?.startTime;
-        if (court && startTime && !isBlocked) {
+        const startTime = cObj?.current?.startTime || cObj?.startTime;
+        if (cObj && startTime && status !== 'blocked') {
           const timePlayed = Math.floor((currentTime.getTime() - new Date(startTime).getTime()) / 60000);
           approachingTimeout = timePlayed >= timeoutWarningMinutes;
         }
 
+        // inside the render/map for each court:
+        const effectiveStatus = (status === 'overtime' && selectable)
+          ? 'overtime-available'
+          : status;
+
+        const base = 'court-card border-4 rounded-xl flex flex-col items-center justify-start p-2 court-transition';
+        const courtClass = base + ' ' + classForStatus(effectiveStatus);
+
         return (
           <div
-            className={`court-card border-4 rounded-xl flex flex-col items-center justify-start p-2 court-transition ${
-              isBlocked
-                ? "bg-gradient-to-b from-stone-200 to-stone-300 border-stone-400"
-                : isAvailable 
-                ? "bg-gradient-to-b from-green-500 to-green-600 border-green-400 shadow-xl" 
-                : isOverdue 
-                  ? (hasEmptyCourts 
-                    ? "bg-gradient-to-b from-slate-400 to-slate-500 border-slate-300" 
-                    : "bg-gradient-to-b from-emerald-600 to-emerald-700 border-emerald-500")
-                  : "bg-gradient-to-b from-blue-400 to-blue-500 border-blue-400"
-            }`}
+            className={courtClass}
             data-court={courtNumber}
-            data-available={isAvailable}
-            role={isAvailable ? "button" : undefined}
-            tabIndex={isAvailable ? 0 : undefined}
-            onClick={isAvailable ? () => window.mobileTapToRegister?.(courtNumber) : undefined}
-            style={{ cursor: isAvailable ? 'pointer' : 'default' }}
+            data-available={status === 'free'}
+            role={status === 'free' ? "button" : undefined}
+            tabIndex={status === 'free' ? 0 : undefined}
+            onClick={status === 'free' ? () => window.mobileTapToRegister?.(courtNumber) : undefined}
+            style={{ cursor: status === 'free' ? 'pointer' : 'default' }}
           >
-            <h3 className={`court-text-lg font-bold ${isBlocked ? 'text-gray-800' : 'text-white'} mb-1`}>
+            <h3 className={`court-text-lg font-bold ${status === 'blocked' || status === 'wet' ? 'text-gray-800' : 'text-white'} mb-1`}>
               Court {courtNumber}
             </h3>
-            <div className={`court-text-sm w-full ${isBlocked ? 'text-gray-800' : 'text-white'} flex flex-col h-full`}>
+            <div className={`court-text-sm w-full ${status === 'blocked' || status === 'wet' ? 'text-gray-800' : 'text-white'} flex flex-col h-full`}>
               
-              {isBlocked ? (
-                <div className="flex flex-col items-center justify-center h-full">
-                  <div className="font-bold court-text-base text-center mb-1 leading-tight">
-                    {(() => {
-                      const title = blockStatus.isWetCourt ? "💧 WET COURT" : 
-                             blockStatus.reason === "MAINTENANCE" ? (blockStatus.eventDetails?.title || blockStatus.title || "COURT WORK") : 
-                             blockStatus.reason === "COURT REPAIR" ? (blockStatus.eventDetails?.title || blockStatus.title || "COURT WORK") :
-                             (blockStatus.eventDetails?.title || blockStatus.title || blockStatus.reason);
-                      return title;
-                    })()}
-                  </div>
-                  <div className="court-text-xs text-center">
-                    {blockStatus.isWetCourt ? (
-                      <span className="text-gray-500">Drying in progress</span>
+              {(() => {
+                const now     = new Date();
+                const { primary, secondary } = computeClock(status, cObj, now);
+                const nm = namesFor(cObj);
+
+                // match legacy court text sizing
+                const primaryClass   = 'mt-1 court-text-base font-bold leading-tight';
+                const secondaryClass = 'mt-1 court-text-xs opacity-90';
+                const namesClass     = 'mt-1 court-text-sm font-medium';
+
+                return (
+                  <div className="flex flex-col h-full">
+                    {/* For Available/Wet/Blocked, center the text */}
+                    {status === 'free' || status === 'wet' || status === 'blocked' ? (
+                      <div className={`${primaryClass} text-center flex-1 flex items-center justify-center`}>
+                        {primary}
+                      </div>
                     ) : (
-                      `Until ${new Date(blockStatus.endTime).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit"
-                      })}`
+                      <>
+                        {/* Time remaining right under Court N */}
+                        <div className={`${primaryClass} text-center`}>{primary}</div>
+                        
+                        {/* Player names in the flexible middle space */}
+                        {(status === 'occupied' || status === 'overtime') && nm ? (
+                          <div className={`${namesClass} text-center flex-1 flex items-center justify-center`}>
+                            {nm}
+                          </div>
+                        ) : (
+                          <div className="flex-1"></div>
+                        )}
+                        
+                        {/* "Until..." at the bottom */}
+                        {secondary ? (
+                          <div className={`${secondaryClass} text-center mb-1`}>{secondary}</div>
+                        ) : null}
+                      </>
                     )}
                   </div>
-                </div>
-              ) : court && (court.players || (court.current && court.current.players)) ? (
-               
-              <>
-                <div className="font-semibold flex items-center gap-1 justify-center mb-1 court-text-lg">
-                  {timeRemaining > 0 ? `${timeRemaining}min` : "Overtime"}
-                </div>
-
-                <div className="space-y-0.5 flex-1">
-                  {(court.current?.players || court.players)?.map((player, idx) => { 
-                    const displayName = formatPlayerName(player.name);
-                    
-                    return (
-                      <div key={idx} className="text-center">
-                        <div className="font-medium court-text-sm player-name px-1">
-                          {displayName}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-                {approachingTimeout ? (
-                  <div className="mt-1 court-text-xs text-center text-yellow-300">
-                    Check status
-                  </div>
-                ) : !isOverdue && (
-                  
-                <div className="mt-1 court-text-xs text-center text-white/80">
-                  Until {new Date(endTime).toLocaleTimeString([], {
-                    hour: "numeric",
-                    minute: "2-digit",
-                  })}
-                </div>
-                )}
-              </>
-              ) : (
-                <>
-                  <div className="text-white/90 court-text-base tracking-wider text-center flex items-center justify-center h-full">
-                    Available
-                  </div>
-                </>
-              )}
+                );
+              })()}
             </div>
           </div>
         );
@@ -1630,6 +1751,22 @@
         const [lastUpdate, setLastUpdate] = useState(new Date());
         const [customMessage, setCustomMessage] = useState("");
         const [courtBlocks, setCourtBlocks] = useState([]);
+        const [refreshTick, setRefreshTick] = useState(0);
+
+        React.useEffect(() => {
+          const onUpdate = () => {
+            setRefreshTick(t => t + 1);
+            scheduleBoardRefresh(); // Use coalescer for data reload
+          };
+          const it = setInterval(onUpdate, 30000); // re-render every 30s
+          document.addEventListener('DATA_UPDATED', onUpdate);
+          document.addEventListener('tennisDataUpdate', onUpdate);
+          return () => {
+            clearInterval(it);
+            document.removeEventListener('DATA_UPDATED', onUpdate);
+            document.removeEventListener('tennisDataUpdate', onUpdate);
+          };
+        }, [loadData]);
 
         // STEP 10: Enhanced data loading with DataStore
         const loadData = useCallback(async () => {
@@ -1710,6 +1847,10 @@
             setWaitingGroups([]);
           }
         }, []);
+        
+        // Expose loadData as refreshBoard for coalescer
+        const refreshBoard = loadData;
+        window.refreshBoard = refreshBoard;
 
         // STEP 11: Event-driven updates with increased frequency
         useEffect(() => {
@@ -1730,11 +1871,15 @@
           
           // Shared Events subscription for availability updates
           if (USE_SHARED_CORE && Events) {
-            Events.onDom('tennisDataUpdate', () => {
-              // recompute with A.getFreeCourts(...) and re-render
-              loadData();
-            });
+            Events.onDom('tennisDataUpdate', scheduleBoardRefresh);
+            Events.onDom('DATA_UPDATED', scheduleBoardRefresh);
           }
+          
+          // Direct document event listeners for re-rendering (using coalescer)
+          document.removeEventListener?.('tennisDataUpdate', scheduleBoardRefresh);
+          document.removeEventListener?.('DATA_UPDATED', scheduleBoardRefresh);
+          document.addEventListener('tennisDataUpdate', scheduleBoardRefresh);
+          document.addEventListener('DATA_UPDATED', scheduleBoardRefresh);
           
           // Increased polling frequency for immediate updates
           const interval = addTimer(setInterval(loadData, CONSTANTS.POLL_INTERVAL_MS));
@@ -1792,6 +1937,20 @@
           });
         };
 
+        // Build status map once
+        const A = window.Tennis?.Domain?.availability || window.Tennis?.Domain?.Availability;
+        const S = window.Tennis?.Storage;
+        const now    = new Date();
+        const data   = S.readDataSafe();
+        const blocks = S.readJSON(S.STORAGE?.BLOCKS) || [];
+        const wetSet = new Set((blocks||[])
+          .filter(b => b?.isWetCourt && new Date(b.startTime ?? b.start) <= now && now < new Date(b.endTime ?? b.end))
+          .map(b => b.courtNumber)
+        );
+        const _statuses = A.getCourtStatuses({ data, now, blocks, wetSet }) || [];
+        const statusByCourt = Object.fromEntries(_statuses.map(s => [s.courtNumber, s.status]));
+        const selectableByCourt = Object.fromEntries(_statuses.map(s => [s.courtNumber, s.selectable]));
+
         return (
           <div className="h-screen min-h-screen bg-gradient-to-br from-slate-700 to-slate-600 p-4 text-white flex flex-col">
             <div className="mb-4">
@@ -1835,11 +1994,12 @@
                       <div key={num} className="flex justify-center">
                         <CourtDisplay
                           courtNumber={num}
-                          court={courts[num - 1]}
                           currentTime={currentTime}
-                          hasEmptyCourts={hasEmptyCourts()}
                           timeoutWarningMinutes={CONSTANTS.TIMEOUT_WARNING_MIN}
                           formatPlayerName={formatPlayerDisplayName}
+                          statusByCourt={statusByCourt}
+                          selectableByCourt={selectableByCourt}
+                          data={data}
                         />
                       </div>
                     ))}
@@ -1856,11 +2016,12 @@
                         <div key={num} className="flex justify-center">
                           <CourtDisplay
                             courtNumber={num}
-                            court={courts[num - 1]}
                             currentTime={currentTime}
-                            hasEmptyCourts={hasEmptyCourts()}
                             timeoutWarningMinutes={CONSTANTS.TIMEOUT_WARNING_MIN}
                             formatPlayerName={formatPlayerDisplayName}
+                            statusByCourt={statusByCourt}
+                            selectableByCourt={selectableByCourt}
+                            data={data}
                           />
                         </div>
                       ))}
@@ -1874,11 +2035,12 @@
                         <CourtDisplay
                           key={num}
                           courtNumber={num}
-                          court={courts[num - 1]}
                           currentTime={currentTime}
-                          hasEmptyCourts={hasEmptyCourts()}
                           timeoutWarningMinutes={CONSTANTS.TIMEOUT_WARNING_MIN}
                           formatPlayerName={formatPlayerDisplayName}
+                          statusByCourt={statusByCourt}
+                          selectableByCourt={selectableByCourt}
+                          data={data}
                         />
                       ))}
                     </div>

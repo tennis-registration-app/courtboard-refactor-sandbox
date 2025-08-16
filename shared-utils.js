@@ -65,16 +65,83 @@
     return out;
   };
 
-  // --- Read, normalize, and self-heal storage if needed
-  const readDataSafe = () => {
-    const current = readJSON(STORAGE.DATA);
-    const normalized = normalizeData(current);
-    if (!current || JSON.stringify(current) !== JSON.stringify(normalized)) {
-      // Self-heal silently
-      writeJSON(STORAGE.DATA, normalized);
+  // --- Pure normalizer (no writes)
+  function normalizeDataShapePure(raw) {
+    const data = raw && typeof raw === 'object'
+      ? (typeof structuredClone === 'function' ? structuredClone(raw)
+        : JSON.parse(JSON.stringify(raw)))
+      : { courts: [], waitingGroups: [], recentlyCleared: [] };
+
+    data.courts = Array.isArray(data.courts) ? data.courts : [];
+    data.waitingGroups = Array.isArray(data.waitingGroups) ? data.waitingGroups : [];
+    data.recentlyCleared = Array.isArray(data.recentlyCleared) ? data.recentlyCleared : [];
+
+    // Ensure each court has {history:[]} (don't create .current)
+    for (let i = 0; i < data.courts.length; i++) {
+      const c = data.courts[i] || {};
+      c.history = Array.isArray(c.history) ? c.history : [];
+      data.courts[i] = c;
     }
-    return normalized;
-  };
+    return data;
+  }
+
+  // --- Local normalizer for read-only shape normalization
+  function normalizeDataShape(data, courtsCount = 12) {
+    const d = (data && typeof data === 'object') ? data : {};
+    const out = { ...d };
+    out.courts          = Array.isArray(d.courts) ? d.courts.slice() : Array.from({length: courtsCount}, () => ({}));
+    out.waitingGroups   = Array.isArray(d.waitingGroups) ? d.waitingGroups.slice() : [];
+    out.recentlyCleared = Array.isArray(d.recentlyCleared) ? d.recentlyCleared.slice() : [];
+    return out; // *** no persistence here ***
+  }
+
+  // --- Read-only data access with in-memory normalization
+  // READ-ONLY GUARANTEE: This function must not persist or mutate storage.
+  function readDataSafe() {
+    // READ-ONLY: never write to storage in this function
+    try {
+      const key = (window.Tennis?.Storage?.STORAGE?.DATA) || 'tennisClubData';
+      const raw = window.localStorage.getItem(key);
+      let data = null;
+      try {
+        data = raw ? JSON.parse(raw) : null;
+      } catch {
+        // malformed JSON → treat as empty, but do not write back
+        data = null;
+      }
+
+      // Build a non-mutating, normalized copy with sane defaults
+      const courtsCount =
+        (window.Tennis?.Config?.COURTS?.COUNT) ??
+        (window.Tennis?.Config?.COURTS) ?? // tolerate older shape
+        12;
+
+      const safe = {};
+      safe.courts = Array.isArray(data?.courts)
+        ? data.courts
+        : Array.from({ length: courtsCount }, () => ({ history: [], current: null }));
+
+      safe.waitingGroups = Array.isArray(data?.waitingGroups) ? data.waitingGroups : [];
+      safe.recentlyCleared = Array.isArray(data?.recentlyCleared) ? data.recentlyCleared : [];
+
+      // Preserve any other top-level fields without mutating the source
+      if (data && typeof data === 'object') {
+        for (const k of Object.keys(data)) {
+          if (k === 'courts' || k === 'waitingGroups' || k === 'recentlyCleared') continue;
+          safe[k] = data[k];
+        }
+      }
+
+      return safe;
+    } catch {
+      // Absolute fallback — never throw; never write
+      return {
+        courts: Array.from({ length: 12 }, () => ({ history: [], current: null })),
+        waitingGroups: [],
+        recentlyCleared: [],
+      };
+    }
+  }
 
   // --- Historical games helpers
   const getHistoricalGames = () => readJSON(STORAGE.HISTORICAL_GAMES) || [];
@@ -134,6 +201,8 @@
     writeJSON,
     getEmptyData,
     normalizeData,
+    normalizeDataShape,
+    normalizeDataShapePure,
     readDataSafe,
     getHistoricalGames,
     addHistoricalGame,

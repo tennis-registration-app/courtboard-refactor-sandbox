@@ -215,10 +215,69 @@
     return overtime;
   }
 
+  function isActiveBlock(b, now) {
+    if (!b) return false;
+    const st = new Date(b.startTime ?? b.start);
+    const et = new Date(b.endTime   ?? b.end);
+    return st instanceof Date && !isNaN(st) &&
+           et instanceof Date && !isNaN(et) &&
+           st <= now && now < et;
+  }
+
+  function getCourtStatuses({ data, now, blocks, wetSet }) {
+    const Av = window.Tennis.Domain.availability || window.Tennis.Domain.Availability;
+    const info = Av.getFreeCourtsInfo({ data, now, blocks, wetSet });
+
+    // sets for quick lookup
+    const S = (arr) => new Set(Array.isArray(arr) ? arr : []);
+    const freeSet     = S(info.free);
+    const occSet      = S(info.occupied);
+    const overtimeSet = S(info.overtime);
+    const wetSetLocal = S(info.wet); // prefer info.wet (already honors blocks + timing)
+
+    // active non-wet blocks
+    const activeBlocked = new Set(
+      (blocks || [])
+        .filter(b => isActiveBlock(b, now))
+        .filter(b => !b.isWetCourt)
+        .map(b => b.courtNumber)
+    );
+
+    // selection policy: free first, else overtime
+    const hasTrueFree = freeSet.size > 0;
+
+    const total = (data?.courts || []).length || (info.meta?.total || 0);
+    const out = [];
+    for (let n = 1; n <= total; n++) {
+      const isWet      = wetSetLocal.has(n);
+      const isBlocked  = activeBlocked.has(n);
+      const isFree     = freeSet.has(n);
+      const isOvertime = overtimeSet.has(n);
+      const isOccupied = occSet.has(n);
+
+      // precedence for a single status label
+      let status = 'free';
+      if (isWet)      status = 'wet';
+      else if (isBlocked)  status = 'blocked';
+      else if (isOvertime) status = 'overtime';
+      else if (isOccupied) status = 'occupied';
+      else if (isFree)     status = 'free';
+
+      // selectable per policy (never wet/blocked)
+      const selectable = (!isWet && !isBlocked) &&
+                         (hasTrueFree ? isFree : isOvertime);
+
+      out.push({ courtNumber: n, status, selectable,
+                 isWet, isBlocked, isFree, isOvertime, isOccupied });
+    }
+    return out;
+  }
+
   // Export on both names (idempotent)
   (function attach(API){
     if (!API.getFreeCourtsInfo) API.getFreeCourtsInfo = getFreeCourtsInfo;
     if (!API.getSelectableCourts) API.getSelectableCourts = getSelectableCourts;
+    if (!API.getCourtStatuses) API.getCourtStatuses = getCourtStatuses;
   })((window.Tennis.Domain.availability || window.Tennis.Domain.Availability));
 
 })();
