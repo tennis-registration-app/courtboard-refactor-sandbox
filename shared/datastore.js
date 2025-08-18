@@ -82,9 +82,19 @@
           // use guarded write path (StorageGuard will prevent clobbering)
           S.writeJSON(DATA_KEY, persisted);
         } finally {
-          // emit both events for compatibility
+          // emit both Tennis.Events AND DOM events for maximum compatibility
           E?.emitDom?.('DATA_UPDATED', { key: DATA_KEY, data: persisted });
           E?.emitDom?.('tennisDataUpdate', { key: DATA_KEY, data: persisted });
+          
+          // Also emit DOM events as backup
+          try {
+            window.dispatchEvent(new CustomEvent('tennisDataUpdate', {
+              detail: { key: DATA_KEY, data: persisted }
+            }));
+            window.dispatchEvent(new CustomEvent('DATA_UPDATED', {
+              detail: { key: DATA_KEY, data: persisted }
+            }));
+          } catch {}
         }
         this.metrics.totalResponseTime += (performance.now() - t0);
         return persisted;

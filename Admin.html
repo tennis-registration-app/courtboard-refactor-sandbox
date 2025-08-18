@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Tennis Admin Panel - DataStore Integrated</title>
+  <link rel="icon" href="data:,">
   <script src="https://cdn.tailwindcss.com"></script>
 
 </head>
@@ -22,10 +23,34 @@
   <script src="./shared/datastore.js"></script>
   <script src="./shared/maintenance.js"></script>
   <script src="./shared/dataservice.js"></script>
+  <script src="./shared/blocks.js"></script>
+
+  <script>
+(function () {
+  if (location.protocol !== 'file:') return;
+
+  console.warn('[dev] Loaded via file:// — this uses a different storage and won\'t receive app events.');
+
+  function addBanner() {
+    var b = document.createElement('div');
+    b.style.cssText = 'position:fixed;left:0;right:0;bottom:0;padding:8px 12px;' +
+                      'background:#f59e0b;color:#111;font:600 14px/1.2 system-ui;' +
+                      'z-index:99999;text-align:center';
+    b.textContent = '⚠️ Running from file:// — use http://127.0.0.1:5500 for correct behavior';
+    document.body.appendChild(b);
+  }
+
+  if (document.body) addBanner();
+  else window.addEventListener('DOMContentLoaded', addBanner, { once: true });
+})();
+</script>
+
   <script src="./domain/time.js"></script>
   <script src="./domain/blocks.js"></script>
   <script src="./domain/wetCourts.js"></script>
   <script src="./domain/availability.js"></script>
+  <script src="./shared/domain/roster.js"></script>
+  <script src="shared/selftest.js"></script>
   <!-- Preflight self-heal (normalize storage shape before app code runs) -->
   <script>try{ window.APP_UTILS && window.APP_UTILS.readDataSafe(); }catch(e){}</script>
   
@@ -39,20 +64,55 @@
    // --- One-time guard helper (no UI change)
    const _one = (key) => (window[key] ? true : (window[key] = true, false));
    
-   // Coalesce multiple data events into a single refresh
-   let __adminRefreshPending = false;
-   function scheduleAdminRefresh() {
-     if (__adminRefreshPending) return;
-     __adminRefreshPending = true;
-     setTimeout(() => {
-       __adminRefreshPending = false;
-       const fn = window.refreshAdminView || (() => window.dispatchEvent(new Event('ADMIN_REFRESH')));
-       fn();
-     }, 0);
-   }
+   // Idempotent coalescer
+   (function () {
+     if (window.scheduleAdminRefresh) return;
 
-   // global fallback bridge (safe if re-run)
-   window.refreshAdminView = window.refreshAdminView || (() => window.dispatchEvent(new Event('ADMIN_REFRESH')));
+     window.__adminRefreshPending = false;
+     window.__adminCoalesceHits = 0; // dev-only metric
+
+     window.scheduleAdminRefresh = function scheduleAdminRefresh() {
+       if (window.__adminRefreshPending) return;
+       window.__adminRefreshPending = true;
+
+       setTimeout(() => {
+         try {
+           window.__adminCoalesceHits++;
+           const fn =
+             window.refreshAdminView ||
+             window.loadData ||
+             null;
+
+           if (typeof fn === 'function') {
+             fn();                           // direct path
+             return;
+           }
+           // bridge path
+           window.dispatchEvent(new Event('ADMIN_REFRESH'));
+         } finally {
+           window.__adminRefreshPending = false;
+         }
+       }, 0);
+     };
+   })();
+
+   // Idempotent wiring (window + document, just in case)
+   (function wireAdminListenersOnce(){
+     if (window.__wiredAdminListeners) return;
+     window.__wiredAdminListeners = true;
+
+     const h = window.scheduleAdminRefresh;
+     if (typeof h !== 'function') return;
+
+     window.addEventListener('tennisDataUpdate', h, { passive: true });
+     window.addEventListener('DATA_UPDATED',      h, { passive: true });
+     window.addEventListener('BLOCKS_UPDATED',    h, { passive: true });
+
+     // backup (some environments dispatch on document)
+     document.addEventListener('tennisDataUpdate', h, { passive: true });
+     document.addEventListener('DATA_UPDATED',      h, { passive: true });
+     document.addEventListener('BLOCKS_UPDATED',    h, { passive: true });
+   })();
    
    // Shared domain modules
    const USE_SHARED_DOMAIN = true;
@@ -323,7 +383,7 @@ const greyFilter = { filter: 'grayscale(100%) opacity(0.6)' };
 const TENNIS_CONFIG = {
   COURTS: { TOTAL_COUNT: 12 },
   TIMING: {
-    CLUB_OPEN: 6.5,
+    CLUB_OPEN: 4,
     CLUB_CLOSE: 22,
     AVG_GAME_TIME_MIN: 75
   },
@@ -849,9 +909,16 @@ const CourtStatusGrid = ({ courts, courtBlocks, selectedDate, onClearCourt, onMo
     setShowActions(null);
   };
 
-  const handleMoveCourt = (from, to) => {
-    onMoveCourt(from, to);
-    setMovingFrom(null);
+  const handleMoveCourt = async (from, to) => {
+    try {
+      const res = await onMoveCourt(from, to);   // <-- await the move
+      if (res?.success) {
+        setMovingFrom(null);                     // exit move mode ONLY on success
+      }
+      // If it failed, we stay in move mode so the user can pick another target.
+    } catch (e) {
+      Tennis?.UI?.toast?.('Unexpected error moving court', { type:'error' });
+    }
   };
 
   const initiateMove = (courtNum) => {
@@ -927,6 +994,7 @@ const handleAllCourtsDry = async () => {
             const isMoving = movingFrom === courtNum;
             const canReceiveMove = movingFrom && movingFrom !== courtNum && status === 'available';
             
+            
             return (
               <div
                 key={courtNum}
@@ -935,13 +1003,11 @@ const handleAllCourtsDry = async () => {
                 } ${canReceiveMove ? 'cursor-pointer hover:bg-green-200' : ''} 
                 ${status === 'wet' ? 'cursor-pointer hover:bg-gray-300' : ''}
                 min-h-[120px] h-[120px] flex flex-col justify-between relative`}
-                onClick={
-                  canReceiveMove 
-                    ? () => handleMoveCourt(movingFrom, courtNum)
-                    : status === 'wet'
-                    ? () => handleWetCourtToggle(courtNum)
-                    : undefined
-                }
+                onClick={canReceiveMove ? () => {
+                  handleMoveCourt(Number(movingFrom), Number(courtNum));
+                } : status === 'wet' ? () => {
+                  handleWetCourtToggle(courtNum);
+                } : undefined}
               >
                 <div>
                   <div className="flex justify-between items-start">
@@ -2694,7 +2760,7 @@ const EventCalendarEnhanced = ({ courts, currentTime, refreshTrigger, onRefresh,
   }
 }, [onEditEvent]);
         
-        const handleDelete = useCallback((event) => {
+        const handleDelete = useCallback(async (event) => {
            console.log('Delete event:', event);
           try {
         const courtBlocks = JSON.parse(localStorage.getItem('courtBlocks') || '[]');
@@ -2710,8 +2776,7 @@ const EventCalendarEnhanced = ({ courts, currentTime, refreshTrigger, onRefresh,
       return block.id !== event.id;
     });
     
-    localStorage.setItem('courtBlocks', JSON.stringify(updatedBlocks));
-    window.dispatchEvent(new Event('tennisDataUpdate'));
+    await Tennis.BlocksService.saveBlocks(updatedBlocks);
     console.log('Event deleted successfully');
     onRefresh();
   } catch (error) {
@@ -3713,7 +3778,7 @@ const CompleteBlockManagerEnhanced = ({
         const currentTime = new Date();
 
         // Wet Court Helper Functions
-        const handleEmergencyWetCourt = () => {
+        const handleEmergencyWetCourt = async () => {
   if (!ENABLE_WET_COURTS) return;
   
   console.log('🌧️ Emergency wet court activated');
@@ -3760,10 +3825,9 @@ const CompleteBlockManagerEnhanced = ({
       createdAt: now
     }));
     
-    // Add to localStorage
+    // Add to storage
     const updatedBlocks = [...existingBlocks, ...wetCourtBlocks];
-    localStorage.setItem('courtBlocks', JSON.stringify(updatedBlocks));
-    window.dispatchEvent(new Event(TENNIS_CONFIG.STORAGE.UPDATE_EVENT));
+    await Tennis.BlocksService.saveBlocks(updatedBlocks);
 
     console.log(`📦 Created ${wetCourtBlocks.length} wet court blocks directly`);
     setRefreshTrigger(prev => prev + 1);
@@ -3774,7 +3838,7 @@ const CompleteBlockManagerEnhanced = ({
 };
 
 
-const removeWetCourtBlock = (courtNumber) => {
+const removeWetCourtBlock = async (courtNumber) => {
   if (!ENABLE_WET_COURTS) return;
   
   try {
@@ -3787,8 +3851,7 @@ const removeWetCourtBlock = (courtNumber) => {
       !(block.isWetCourt && block.courtNumber === courtNumber)
     );
     
-    localStorage.setItem('courtBlocks', JSON.stringify(updatedBlocks));
-    window.dispatchEvent(new Event(TENNIS_CONFIG.STORAGE.UPDATE_EVENT));
+    await Tennis.BlocksService.saveBlocks(updatedBlocks);
 
     console.log(`🗑️ Removed wet court block for court ${courtNumber}`);
     setRefreshTrigger(prev => prev + 1); // Refresh timeline
@@ -3798,7 +3861,7 @@ const removeWetCourtBlock = (courtNumber) => {
   }
 };
 
-const removeAllWetCourtBlocks = () => {
+const removeAllWetCourtBlocks = async () => {
   if (!ENABLE_WET_COURTS) return;
   
   try {
@@ -3809,8 +3872,7 @@ const removeAllWetCourtBlocks = () => {
     // Remove all wet court blocks
     const updatedBlocks = existingBlocks.filter(block => !block.isWetCourt);
     
-    localStorage.setItem('courtBlocks', JSON.stringify(updatedBlocks));
-    window.dispatchEvent(new Event(TENNIS_CONFIG.STORAGE.UPDATE_EVENT));
+    await Tennis.BlocksService.saveBlocks(updatedBlocks);
 
     console.log('🧹 Removed all wet court blocks');
     setRefreshTrigger(prev => prev + 1); // Refresh timeline
@@ -4002,7 +4064,7 @@ const deactivateWetCourts = () => {
           setEventTitle('');
         };
         
-        const handleRemoveBlock = (blockId) => {
+        const handleRemoveBlock = async (blockId) => {
     console.log('🗑️ Trying to delete block with ID:', blockId);
         try {
     let existingBlocks = [];
@@ -4018,8 +4080,7 @@ const deactivateWetCourts = () => {
     console.log('📋 Blocks after filter:', updatedBlocks);
     console.log('📊 Length before:', existingBlocks.length, 'Length after:', updatedBlocks.length);
     
-    localStorage.setItem('courtBlocks', JSON.stringify(updatedBlocks));
-    window.dispatchEvent(new Event(TENNIS_CONFIG.STORAGE.UPDATE_EVENT));
+    await Tennis.BlocksService.saveBlocks(updatedBlocks);
     console.log('✅ Delete operation completed');
     setRefreshTrigger(prev => prev + 1);
   } catch (error) {
@@ -5221,7 +5282,7 @@ const AdminPanelV2 = ({ onExit }) => {
   const [selectedDate, setSelectedDate] = useState(new Date());
   const ENABLE_WET_COURTS = true;
 
-  const handleEmergencyWetCourt = () => {
+  const handleEmergencyWetCourt = async () => {
   console.log('🌧️ Emergency wet court activated');
   
   // Set all courts as wet in state immediately
@@ -5265,8 +5326,7 @@ const AdminPanelV2 = ({ onExit }) => {
     }));
     
     const updatedBlocks = [...existingBlocks, ...wetCourtBlocks];
-    localStorage.setItem('courtBlocks', JSON.stringify(updatedBlocks));
-    window.dispatchEvent(new Event(TENNIS_CONFIG.STORAGE.UPDATE_EVENT));
+    await Tennis.BlocksService.saveBlocks(updatedBlocks);
     setRefreshTrigger(prev => prev + 1);
   } catch (error) {
     console.error('Error creating wet court blocks:', error);
@@ -5285,7 +5345,7 @@ const handleEditBlockFromStatus = (block) => {
   }, 100);
 };
 
-const removeAllWetCourtBlocks = () => {
+const removeAllWetCourtBlocks = async () => {
   if (!ENABLE_WET_COURTS) return;
   
   try {
@@ -5296,8 +5356,7 @@ const removeAllWetCourtBlocks = () => {
     // Remove all wet court blocks
     const updatedBlocks = existingBlocks.filter(block => !block.isWetCourt);
     
-    localStorage.setItem('courtBlocks', JSON.stringify(updatedBlocks));
-    window.dispatchEvent(new Event(TENNIS_CONFIG.STORAGE.UPDATE_EVENT));
+    await Tennis.BlocksService.saveBlocks(updatedBlocks);
     setRefreshTrigger(prev => prev + 1);
 
     console.log('🧹 Removed all wet court blocks');
@@ -5306,7 +5365,7 @@ const removeAllWetCourtBlocks = () => {
   }
 };
 
-const clearWetCourt = (courtNumber) => {
+const clearWetCourt = async (courtNumber) => {
   console.log(`☀️ Clearing wet court ${courtNumber}`);
   
   const newWetCourts = new Set(wetCourts);
@@ -5325,8 +5384,7 @@ const clearWetCourt = (courtNumber) => {
     const updatedBlocks = existingBlocks.filter(block => 
       !(block.isWetCourt && block.courtNumber === courtNumber)
     );
-    localStorage.setItem('courtBlocks', JSON.stringify(updatedBlocks));
-    window.dispatchEvent(new Event(TENNIS_CONFIG.STORAGE.UPDATE_EVENT));
+    await Tennis.BlocksService.saveBlocks(updatedBlocks);
     setRefreshTrigger(prev => prev + 1);
   } catch (error) {
     console.error('Error removing wet court block:', error);
@@ -5354,7 +5412,6 @@ const deactivateWetCourts = () => {
 
   // Load data from localStorage
   const loadData = useCallback(async () => {
-    window.refreshAdminView = loadData; // expose for coalescer & tests
     try {
       // Load court data
       const courtData = await dataStore.get(TENNIS_CONFIG.STORAGE.KEY);
@@ -5379,6 +5436,8 @@ const deactivateWetCourts = () => {
       onNotification('Failed to load data', 'error');
     }
   }, []);
+
+  window.refreshAdminView = loadData; // export for coalescer & tests
   
   // Event-driven refresh bridge listener
   React.useEffect(() => {
@@ -5438,8 +5497,8 @@ const deactivateWetCourts = () => {
       }
     };
     
-    window.addEventListener('tennisDataUpdate', scheduleAdminRefresh, { passive: true });
-    window.addEventListener('DATA_UPDATED', scheduleAdminRefresh, { passive: true });
+    window.addEventListener('tennisDataUpdate', window.scheduleAdminRefresh, { passive: true });
+    window.addEventListener('DATA_UPDATED', window.scheduleAdminRefresh, { passive: true });
     window.addEventListener('storage', handleStorageEvent, { passive: true });
     
     // defensive cleanup on unload as well
@@ -5530,11 +5589,28 @@ useEffect(() => {
   }
 };
 
-  const moveCourt = (from, to) => {
-    const newCourts = [...courts];
-    newCourts[to - 1] = newCourts[from - 1];
-    newCourts[from - 1] = null;
-    saveData(newCourts, waitingGroups);
+  const moveCourt = async (from, to) => {
+    const TD = window.TennisDataService || window.Tennis?.DataService;
+    const f = Number(from), t = Number(to);
+
+    if (!TD?.moveCourt) {
+      Tennis?.UI?.toast?.('Move is temporarily unavailable', { type:'error' });
+      return { success:false, error:'Service unavailable' };
+    }
+
+    const res = await TD.moveCourt(f, t);
+
+    if (!res?.success) {
+      Tennis?.UI?.toast?.(res?.error || 'Failed to move court', { type:'error' });
+      return res;
+    }
+
+    Tennis?.UI?.toast?.(`Moved from Court ${res.from} to Court ${res.to}`, { type:'success' });
+
+    // Belt & suspenders: coalescer should refresh, but trigger explicit refresh too.
+    window.refreshAdminView?.();
+
+    return res;
   };
 
   const clearAllCourts = () => {
@@ -7214,8 +7290,8 @@ const AnalyticsDashboard = ({ onClose }) => {
       position: fixed;
       top: 10px;
       right: 10px;
-      width: 320px;
-      max-height: 400px;
+      width: 350px;
+      max-height: 500px;
       background: rgba(0, 0, 0, 0.85);
       color: #0f0;
       font-family: 'Courier New', monospace;
@@ -7224,10 +7300,18 @@ const AnalyticsDashboard = ({ onClose }) => {
       border-radius: 4px;
       overflow-y: auto;
       z-index: 99999;
-      pointer-events: none;
+      pointer-events: auto;
       border: 1px solid #0f0;
     `;
-    debugPanel.innerHTML = '<div style="color: #ff0; margin-bottom: 5px;">DEBUG MODE - Events Log</div><div id="debugContent"></div>';
+    debugPanel.innerHTML = `
+      <div style="color: #ff0; margin-bottom: 5px;">DEBUG MODE - Events Log</div>
+      <div style="margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 8px;">
+        <button id="runSelfTests" style="background: #333; color: #0f0; border: 1px solid #0f0; padding: 4px 8px; border-radius: 3px; font-family: inherit; font-size: 10px; cursor: pointer;">Run self-tests</button>
+        <span style="color: #666; font-size: 10px; margin-left: 8px;">Press 't' to run</span>
+        <div id="selfTestResults" style="margin-top: 5px; font-size: 10px;"></div>
+      </div>
+      <div id="debugContent"></div>
+    `;
     document.body.appendChild(debugPanel);
 
     const updateDebugPanel = () => {
@@ -7246,6 +7330,88 @@ const AnalyticsDashboard = ({ onClose }) => {
         </div>`;
       }).join('');
     };
+
+    // Safe wrapper for self-tests
+    function runSelfTestsSafe() {
+      const fn = window.Tennis?.selfTest?.runAll;
+      if (typeof fn !== 'function') {
+        return {
+          passed: 0, failed: 1,
+          results: [{ name: 'SelfTest not available', ok: false, notes: 'Tennis.selfTest.runAll missing' }]
+        };
+      }
+      try { return fn(); }
+      catch (e) {
+        return {
+          passed: 0, failed: 1,
+          results: [{ name: 'Run failed', ok: false, notes: String(e?.message || e) }]
+        };
+      }
+    }
+
+    function renderSelfTestResults(result) {
+      const resultsDiv = document.getElementById('selfTestResults');
+      if (!resultsDiv) return;
+      
+      const timestamp = new Date().toLocaleTimeString();
+      const passed = result.passed || 0;
+      const failed = result.failed || 0;
+      
+      // Summary with color coding
+      const summaryColor = failed > 0 ? '#f00' : '#0f0';
+      let html = `<div style="color: ${summaryColor}; font-weight: bold;">${passed} passed / ${failed} failed</div>`;
+      html += `<div style="color: #666; font-size: 9px;">Last run: ${timestamp}</div>`;
+      
+      // Compact table
+      if (result.results && result.results.length > 0) {
+        html += '<div style="margin-top: 5px; max-height: 150px; overflow-y: auto;">';
+        html += '<table style="width: 100%; font-size: 9px; border-collapse: collapse;">';
+        html += '<tr style="color: #ff0;"><th style="text-align: left; padding: 2px;">Test</th><th style="text-align: center; padding: 2px;">OK</th><th style="text-align: left; padding: 2px;">Notes</th></tr>';
+        
+        result.results.forEach(test => {
+          const okColor = test.ok ? '#0f0' : '#f00';
+          const okText = test.ok ? '✓' : '✗';
+          html += `<tr style="border-top: 1px solid #333;">`;
+          html += `<td style="padding: 2px; color: #fff;">${test.name || test.Test || ''}</td>`;
+          html += `<td style="padding: 2px; text-align: center; color: ${okColor};">${okText}</td>`;
+          html += `<td style="padding: 2px; color: #aaa;">${(test.notes || test.Notes || '').slice(0, 30)}${(test.notes || test.Notes || '').length > 30 ? '...' : ''}</td>`;
+          html += `</tr>`;
+        });
+        html += '</table></div>';
+      }
+      
+      resultsDiv.innerHTML = html;
+    }
+
+    let running = false;
+    async function handleRunSelfTests() {
+      if (running) return;
+      running = true;
+      try {
+        const resultsDiv = document.getElementById('selfTestResults');
+        if (resultsDiv) {
+          resultsDiv.innerHTML = '<div style="color: #ff0;">Running tests...</div>';
+        }
+        const result = await runSelfTestsSafe();
+        renderSelfTestResults(result);
+      } finally {
+        running = false;
+      }
+    }
+    
+    // Button click handler
+    const runButton = document.getElementById('runSelfTests');
+    if (runButton) {
+      runButton.addEventListener('click', handleRunSelfTests);
+    }
+    
+    // Keyboard shortcut (t key)
+    window.addEventListener('keydown', (e) => {
+      if ((e.key || '').toLowerCase() === 't') {
+        e.preventDefault();
+        handleRunSelfTests();
+      }
+    }, { passive: false });
 
     // Update every 500ms
     setInterval(updateDebugPanel, 500);

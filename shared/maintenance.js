@@ -33,3 +33,31 @@
   
   T.Maintenance = { autoClearOverdueSessions, listOverdueCourts };
 })();
+
+Tennis.Maintenance = Tennis.Maintenance || {};
+Tennis.Maintenance.enrichActiveSessionsWithMemberIds = function() {
+  const S = Tennis.Storage;
+  const R = Tennis.Domain.roster;
+  const data = S.readDataClone();
+  const roster = S.readJSON('tennisMembers') || S.readJSON('members') || window.__memberRoster || [];
+
+  let touched = 0;
+  for (const court of (data.courts || [])) {
+    const arr = Array.isArray(court?.current?.players) ? court.current.players : [];
+    const enriched = R.enrichPlayersWithIds(arr, roster);
+    for (let i=0;i<arr.length;i++) {
+      if (!arr[i].memberId && enriched[i]?.memberId) { arr[i] = enriched[i]; touched++; }
+    }
+  }
+  for (const g of (data.waitingGroups || [])) {
+    const arr = Array.isArray(g?.players) ? g.players : [];
+    const enriched = R.enrichPlayersWithIds(arr, roster);
+    for (let i=0;i<arr.length;i++) {
+      if (!arr[i].memberId && enriched[i]?.memberId) { arr[i] = enriched[i]; touched++; }
+    }
+  }
+  if (touched > 0) {
+    return (window.TennisDataService || Tennis?.DataService)?.saveData(data).then(()=>touched);
+  }
+  return Promise.resolve(0);
+};

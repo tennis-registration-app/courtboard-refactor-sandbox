@@ -30,14 +30,16 @@
           continue;
         }
         
-        // Check if court is occupied
+        // Check if court is occupied (has any current session, regardless of timing)
         let isOccupied = false;
         if (court) {
-          // Check new structure (court.current)
-          if (court.current && court.current.players && court.current.players.length > 0) {
+          // Check new structure (court.current) - if it exists, court is not truly free
+          if (court.current) {
+            // Any current session means the court is not free for new assignment
+            // This includes both active sessions and overtime sessions
             isOccupied = true;
           }
-          // Check old structure (court.players)
+          // Check old structure (court.players) - fallback for legacy data
           else if (court.players && court.players.length > 0) {
             isOccupied = true;
           }
@@ -151,10 +153,29 @@
     const all   = Array.from({ length: total }, (_, i) => i + 1);
     const wet   = Array.from(new Set([...(wetSet || new Set())])).sort((a,b)=>a-b);
 
+    // DEBUG: Check what data we're actually getting
+    const dataSnapshot = {
+      isNull: data === null,
+      isUndefined: data === undefined,
+      hasCourts: !!data?.courts,
+      courtsLength: Array.isArray(data?.courts) ? data.courts.length : 'NOT_ARRAY',
+      courtsWithCurrent: Array.isArray(data?.courts) ? data.courts.filter(c => c?.current).length : 0,
+      firstCourtCurrent: data?.courts?.[0]?.current || null
+    };
+
     // Use existing API for free list (honors wetSet/blocks per current logic)
     const arr  = (window.Tennis.Domain.availability || window.Tennis.Domain.Availability)
                    .getFreeCourts({ data, now, blocks, wetSet }) || [];
     const free = Array.isArray(arr) ? arr.slice().sort((a,b)=>a-b) : (arr.free || []);
+    
+    // DEBUG: Log when we get suspicious results
+    if (free.length >= 11) {
+      console.log('🔍 getFreeCourtsInfo - ALL COURTS FREE detected:', {
+        dataSnapshot,
+        freeCount: free.length,
+        callerStack: new Error().stack.split('\n').slice(1, 4)
+      });
+    }
     const freeSet = new Set(free);
 
     // NEW: overtime detection
@@ -257,20 +278,132 @@
 
       // precedence for a single status label
       let status = 'free';
+      let blockedLabel = null;
+      let blockedEnd = null;
+
       if (isWet)      status = 'wet';
-      else if (isBlocked)  status = 'blocked';
+      else if (isBlocked) {
+        status = 'blocked';
+        // Find the active block for this court
+        const activeBlock = (blocks || []).find(b => 
+          b.courtNumber === n && isActiveBlock(b, now) && !b.isWetCourt
+        );
+        if (activeBlock) {
+          const b = activeBlock;
+          blockedLabel = b.label || b.title || b.templateName || b.reason || b.type || 'Blocked';
+          blockedEnd = b.endTime || b.end || b.until || null;
+        }
+      }
       else if (isOvertime) status = 'overtime';
       else if (isOccupied) status = 'occupied';
       else if (isFree)     status = 'free';
 
-      // selectable per policy (never wet/blocked)
+      // strict selectable policy: free OR overtime (when no free exists)
       const selectable = (!isWet && !isBlocked) &&
-                         (hasTrueFree ? isFree : isOvertime);
+                         ((status === 'free') || (status === 'overtime' && !hasTrueFree));
+      
+      // selectable reason for styling
+      const selectableReason = selectable
+        ? (status === 'free' ? 'free' : 'overtime_fallback')
+        : null;
 
-      out.push({ courtNumber: n, status, selectable,
-                 isWet, isBlocked, isFree, isOvertime, isOccupied });
+      const courtStatus = { 
+        courtNumber: n, 
+        status, 
+        selectable,
+        selectableReason,
+        isWet, isBlocked, isFree, isOvertime, isOccupied 
+      };
+      
+      // Add blocked-specific fields if applicable
+      if (status === 'blocked') {
+        courtStatus.blockedLabel = blockedLabel;
+        courtStatus.blockedEnd = blockedEnd;
+      }
+
+      out.push(courtStatus);
     }
     return out;
+  }
+
+  // Assignment helpers for preventing bumping
+  function getSelectableCourtsForAssignment({ data, now, blocks, wetSet }) {
+    // Use existing selectable logic but enforce stricter rules for assignment
+    const selectable = getSelectableCourts({ data, now, blocks, wetSet });
+    
+    // For assignment, only allow truly free courts (no overtime bumping)
+    const info = getFreeCourtsInfo({ data, now, blocks, wetSet });
+    const trulyFree = info.free || [];
+    
+    // Filter selectable to only include truly free courts
+    return selectable.filter(n => trulyFree.includes(n));
+  }
+
+  function canAssignToCourt(courtNumber, { data, now, blocks, wetSet }) {
+    const assignable = getSelectableCourtsForAssignment({ data, now, blocks, wetSet });
+    return assignable.includes(courtNumber);
+  }
+
+  // Strict selectable API - canonical source of truth
+  function getSelectableCourtsStrict({ data, now, blocks = [], wetSet = new Set() }) {
+    const info = getFreeCourtsInfo({ data, now, blocks, wetSet });
+    const free = info.free || [];
+    const overtime = info.overtime || [];
+    
+    // DEBUG: Log what we're returning to catch inappropriate selections
+    const courtDetails = data?.courts?.map((c, i) => {
+      const courtNum = i + 1;
+      const current = c?.current;
+      const endTime = current?.endTime;
+      const endDate = endTime ? new Date(endTime) : null;
+      const isActive = endDate ? endDate > now : false;
+      
+      return {
+        court: courtNum,
+        hasCurrent: !!current,
+        endTime: endTime ? endDate.toLocaleTimeString() : null,
+        isActive,
+        players: current?.players?.length || 0,
+        inFreeList: free.includes(courtNum),
+        inOvertimeList: overtime.includes(courtNum)
+      };
+    });
+    
+    // Only log when something suspicious happens (all courts free or occupied courts in free list)
+    const suspiciousLog = free.length >= 11 || courtDetails.some(c => c.isActive && c.inFreeList);
+    
+    if (suspiciousLog) {
+      console.log('🚨 [getSelectableCourtsStrict] SUSPICIOUS - ALL COURTS FREE!', {
+        now: now.toLocaleTimeString(),
+        free,
+        overtime,
+        courtDetails: courtDetails.map(c => ({
+          court: c.court,
+          hasCurrent: c.hasCurrent,
+          endTime: c.endTime,
+          isActive: c.isActive,
+          players: c.players
+        })),
+        dataPointer: data === null ? 'NULL' : typeof data,
+        courtsPointer: data?.courts === null ? 'NULL' : Array.isArray(data?.courts) ? `Array(${data.courts.length})` : typeof data?.courts
+      });
+    } else {
+      console.log('[getSelectableCourtsStrict] Normal:', {
+        now: now.toLocaleTimeString(),
+        freeCount: free.length,
+        occupiedCourts: courtDetails.filter(c => c.isActive).map(c => `Court ${c.court} (until ${c.endTime})`)
+      });
+    }
+    
+    return free.length > 0 ? free : overtime;
+  }
+
+  // Returns true only if there is NOTHING the user can select
+  // (neither free nor overtime courts). This preserves the policy
+  // that overtime courts are selectable when free courts are exhausted.
+  function shouldAllowWaitlistJoin({ data, now, blocks = [], wetSet = new Set() }) {
+    const strict = getSelectableCourtsStrict({ data, now, blocks, wetSet });
+    return (strict && typeof strict.size === 'number' ? strict.size : strict.length || 0) === 0;
   }
 
   // Export on both names (idempotent)
@@ -278,6 +411,10 @@
     if (!API.getFreeCourtsInfo) API.getFreeCourtsInfo = getFreeCourtsInfo;
     if (!API.getSelectableCourts) API.getSelectableCourts = getSelectableCourts;
     if (!API.getCourtStatuses) API.getCourtStatuses = getCourtStatuses;
+    if (!API.getSelectableCourtsForAssignment) API.getSelectableCourtsForAssignment = getSelectableCourtsForAssignment;
+    if (!API.canAssignToCourt) API.canAssignToCourt = canAssignToCourt;
+    if (!API.getSelectableCourtsStrict) API.getSelectableCourtsStrict = getSelectableCourtsStrict;
+    if (!API.shouldAllowWaitlistJoin) API.shouldAllowWaitlistJoin = shouldAllowWaitlistJoin;
   })((window.Tennis.Domain.availability || window.Tennis.Domain.Availability));
 
 })();

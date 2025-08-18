@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Tennis Court Display - DataStore Integrated</title>
+  <link rel="icon" href="data:,">
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     /* Ensure full height layout */
@@ -529,10 +530,35 @@
   <script src="./shared/storage.js"></script>
   <script src="./shared/events.js"></script>
   <script src="./shared/datastore.js"></script>
+  <script src="./shared/dataservice.js"></script>
+  <script src="./shared/blocks.js"></script>
   <script src="./shared/maintenance.js"></script>
+
+  <script>
+(function () {
+  if (location.protocol !== 'file:') return;
+
+  console.warn('[dev] Loaded via file:// — this uses a different storage and won\'t receive app events.');
+
+  function addBanner() {
+    var b = document.createElement('div');
+    b.style.cssText = 'position:fixed;left:0;right:0;bottom:0;padding:8px 12px;' +
+                      'background:#f59e0b;color:#111;font:600 14px/1.2 system-ui;' +
+                      'z-index:99999;text-align:center';
+    b.textContent = '⚠️ Running from file:// — use http://127.0.0.1:5500 for correct behavior';
+    document.body.appendChild(b);
+  }
+
+  if (document.body) addBanner();
+  else window.addEventListener('DOMContentLoaded', addBanner, { once: true });
+})();
+</script>
+
   <script src="./domain/time.js"></script>
   <script src="./domain/availability.js"></script>
   <script src="./domain/waitlist.js"></script>
+  <script src="./shared/domain/roster.js"></script>
+  <script src="shared/selftest.js"></script>
   
   <script>
   (function(){
@@ -650,6 +676,14 @@
       DURATION_MIN: { SINGLES: 60, DOUBLES: 90, MAX: 240 }
     };
     
+    // --- Waiting selectors (CourtBoard) ---
+    function selectWaitingGroups(data) {
+      return Array.isArray(data?.waitingGroups) ? data.waitingGroups : [];
+    }
+    function selectWaitingCount(data) {
+      return selectWaitingGroups(data).length;
+    }
+
     // ---- Read-only guard (prevent accidental writes in this view) ----
     const readOnlyWrite = (...args) => {
       console.warn('Read-only view: write ignored', args);
@@ -657,15 +691,22 @@
     };
     
     // Status → Tailwind classes (no color classes outside this map)
-    function classForStatus(status) {
-      switch (status) {
+    function classForStatus(statusObj) {
+      const s = typeof statusObj === 'string' ? statusObj : statusObj?.status;
+      const selectable = statusObj?.selectable;
+      const selectableReason = statusObj?.selectableReason;
+      
+      switch (s) {
         case 'occupied':           // blue (in use)
           return 'bg-gradient-to-b from-blue-400 to-blue-500 border-blue-400';
-        case 'overtime':           // grey (overtime, not selectable)
-          return 'bg-gradient-to-b from-gray-300 to-gray-400 border-gray-300';
-        case 'overtime-available': // dark green (overtime but selectable)
+        case 'overtime':
+          // dark green if selectable (fallback), grey if not
+          return selectable 
+            ? 'bg-gradient-to-b from-emerald-600 to-emerald-700 border-emerald-600'
+            : 'bg-gradient-to-b from-gray-300 to-gray-400 border-gray-300';
+        case 'overtime-available': // legacy support
           return 'bg-gradient-to-b from-emerald-600 to-emerald-700 border-emerald-600';
-        case 'overtimeAvailable':  // dark green (overtime but selectable)
+        case 'overtimeAvailable':  // legacy support
           return 'bg-gradient-to-b from-green-600 to-green-700 border-green-600';
         case 'wet':                // grey (or your wet palette)
         case 'blocked':
@@ -725,6 +766,21 @@
       return '';
     }
 
+    // Formats an ISO string or Date to "12:34 PM"
+    function formatUntilTime(dt) {
+      if (!dt) return null;
+      const d = (dt instanceof Date) ? dt : new Date(dt);
+      if (isNaN(+d)) return null;
+      return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    }
+
+    function formatTime(dt) {
+      if (!dt) return null;
+      const d = dt instanceof Date ? dt : new Date(dt);
+      if (isNaN(+d)) return null;
+      return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    }
+
     function labelFor(status, courtObj) {
       if (status === 'occupied') {
         const end = courtObj?.current?.endTime ? new Date(courtObj.current.endTime) : null;
@@ -741,7 +797,22 @@
       // free, wet, blocked etc.
       if (status === 'free') return 'Available';
       if (status === 'wet') return 'Wet';
-      if (status === 'blocked') return 'Blocked';
+      if (status === 'blocked') {
+        const label = courtObj?.blockedLabel || 'Blocked';
+        const until = courtObj?.blockedEnd ? courtObj.blockedEnd : null;
+        if (until) {
+          try {
+            const endTime = new Date(until);
+            if (!isNaN(endTime)) {
+              const timeStr = endTime.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+              return `${label}\nUntil ${timeStr}`;
+            }
+          } catch (e) {
+            // ignore invalid date
+          }
+        }
+        return label;
+      }
       return '';
     }
 
@@ -760,7 +831,23 @@
       if (status === 'overtime') return { primary: 'Overtime', secondary: '' };
       if (status === 'free')     return { primary: 'Available', secondary: '' };
       if (status === 'wet')      return { primary: 'Wet', secondary: '' };
-      if (status === 'blocked')  return { primary: 'Blocked', secondary: '' };
+      if (status === 'blocked') {
+        const s = courtObj || {};
+        const label = s.blockedLabel || 'Blocked';
+        const until = s.blockedEnd ? s.blockedEnd : null;
+        let secondary = '';
+        if (until) {
+          try {
+            const endTime = new Date(until);
+            if (!isNaN(endTime)) {
+              secondary = `Until ${endTime.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+            }
+          } catch (e) {
+            // ignore invalid date
+          }
+        }
+        return { primary: label, secondary };
+      }
       return { primary: '', secondary: '' };
     }
 
@@ -1028,15 +1115,28 @@
         formatPlayerName = (name) => name,
         statusByCourt,
         selectableByCourt,
+        statusObjectByCourt,
         data
       }) => {
 
         const status = statusByCourt[courtNumber] || 'free';
         const selectable = selectableByCourt[courtNumber] || false;
+        const statusObj = statusObjectByCourt?.[courtNumber] || {};
+        const s = statusObj;
         const cObj    = data?.courts?.[courtNumber - 1] || {};
         const content = labelFor(status, cObj);
         const blockStatus = getCourtBlockStatus(courtNumber);
         const endTime = cObj?.current?.endTime || cObj?.endTime;
+        
+        // Compute end times once
+        const endIso =
+          s?.endTime ||
+          s?.originalEndTime ||
+          cObj?.current?.endTime ||
+          null;
+
+        const showUntilForOccupied = status === 'occupied' && !s?.isOverdue && endIso;
+        const blockedUntil = status === 'blocked' ? s?.blockedEnd : null;
         const timeRemaining = cObj && endTime && status !== 'blocked'
           ? Math.max(0, Math.floor((new Date(endTime).getTime() - currentTime.getTime()) / 60000))
           : 0;
@@ -1048,12 +1148,8 @@
         }
 
         // inside the render/map for each court:
-        const effectiveStatus = (status === 'overtime' && selectable)
-          ? 'overtime-available'
-          : status;
-
         const base = 'court-card border-4 rounded-xl flex flex-col items-center justify-start p-2 court-transition';
-        const courtClass = base + ' ' + classForStatus(effectiveStatus);
+        const courtClass = base + ' ' + classForStatus(s);
 
         return (
           <div
@@ -1072,7 +1168,7 @@
               
               {(() => {
                 const now     = new Date();
-                const { primary, secondary } = computeClock(status, cObj, now);
+                const { primary, secondary } = computeClock(status, status === 'blocked' ? statusObj : cObj, now);
                 const nm = namesFor(cObj);
 
                 // match legacy court text sizing
@@ -1081,19 +1177,32 @@
                 const namesClass     = 'mt-1 court-text-sm font-medium';
 
                 return (
-                  <div className="flex flex-col h-full">
-                    {/* For Available/Wet/Blocked, center the text */}
-                    {status === 'free' || status === 'wet' || status === 'blocked' ? (
-                      <div className={`${primaryClass} text-center flex-1 flex items-center justify-center`}>
-                        {primary}
-                      </div>
-                    ) : (
+                  <div className="flex flex-col h-full w-full">
+                    {status === 'free' || status === 'wet' ? (
+                      <>
+                        <div className={`${primaryClass} text-center flex-1 flex items-center justify-center`}>
+                          {primary}
+                        </div>
+                      </>
+                    ) : status === 'blocked' ? (
+                      <>
+                        <div className={`${primaryClass} text-center`}>
+                          {s.blockedLabel || 'Blocked'}
+                        </div>
+                        <div className="flex-1"></div>
+                        {blockedUntil && (
+                          <div className="mt-auto text-sm opacity-90 text-center">
+                            Until {formatTime(blockedUntil)}
+                          </div>
+                        )}
+                      </>
+                    ) : status === 'occupied' ? (
                       <>
                         {/* Time remaining right under Court N */}
                         <div className={`${primaryClass} text-center`}>{primary}</div>
                         
                         {/* Player names in the flexible middle space */}
-                        {(status === 'occupied' || status === 'overtime') && nm ? (
+                        {nm ? (
                           <div className={`${namesClass} text-center flex-1 flex items-center justify-center`}>
                             {nm}
                           </div>
@@ -1102,11 +1211,27 @@
                         )}
                         
                         {/* "Until..." at the bottom */}
-                        {secondary ? (
-                          <div className={`${secondaryClass} text-center mb-1`}>{secondary}</div>
-                        ) : null}
+                        {showUntilForOccupied && (
+                          <div className="mt-auto text-sm opacity-90 text-center">
+                            Until {formatTime(endIso)}
+                          </div>
+                        )}
                       </>
-                    )}
+                    ) : status === 'overtime' ? (
+                      <>
+                        {/* Overtime - no "Until..." */}
+                        <div className={`${primaryClass} text-center`}>{primary}</div>
+                        
+                        {/* Player names in the flexible middle space */}
+                        {nm ? (
+                          <div className={`${namesClass} text-center flex-1 flex items-center justify-center`}>
+                            {nm}
+                          </div>
+                        ) : (
+                          <div className="flex-1"></div>
+                        )}
+                      </>
+                    ) : null}
                   </div>
                 );
               })()}
@@ -1212,9 +1337,9 @@
                         <span className="courtboard-waiting-number font-bold mr-2 text-green-400">{idx + 1}.</span>
                         <div className="flex-1">
                           <span className="courtboard-text-sm font-medium player-name">
-                            {group.players
-                              .map((player) => {
-                                const names = player.name.split(" ");
+                            {(group.names || [])
+                              .map((name) => {
+                                const names = name.split(" ");
                                 return names[names.length - 1];
                               })
                               .join(" / ")}
@@ -1589,6 +1714,7 @@
                     </div>
                 </>
               )}
+
             </div>
             <div className="mt-auto pt-4">
               <ReservedCourtsPanel
@@ -1754,7 +1880,8 @@
         const [refreshTick, setRefreshTick] = useState(0);
 
         React.useEffect(() => {
-          const onUpdate = () => {
+          const onUpdate = (event) => {
+            console.log('[BOARD DEBUG] onUpdate event received:', event?.type, event?.detail);
             setRefreshTick(t => t + 1);
             scheduleBoardRefresh(); // Use coalescer for data reload
           };
@@ -1767,6 +1894,23 @@
             document.removeEventListener('tennisDataUpdate', onUpdate);
           };
         }, [loadData]);
+
+        // Waitlist normalizer
+        function normalizeWaitingGroups(data) {
+          const raw = Array.isArray(data?.waitingGroups) ? data.waitingGroups : [];
+          return raw
+            .map((g, idx) => {
+              const players = Array.isArray(g?.players) ? g.players : [];
+              const guestsArr = Array.isArray(g?.guests)
+                ? g.guests
+                : (Number.isFinite(g?.guests) && g.guests > 0 ? Array(g.guests).fill({ name: 'Guest' }) : []);
+              const names = [...players, ...guestsArr]
+                .map(p => p?.name || p?.id)
+                .filter(Boolean);
+              return names.length ? { id: g.id || `wg_${idx}`, names } : null;
+            })
+            .filter(Boolean);
+        }
 
         // STEP 10: Enhanced data loading with DataStore
         const loadData = useCallback(async () => {
@@ -1783,6 +1927,69 @@
             if (storedData) {
               const data = storedData;
               
+              // --- WAITLIST DEBUG (no UI change) ---
+              (function debugWaitlist() {
+                try {
+                  const U = window.APP_UTILS;
+                  const data = U.readDataSafe(); // fresh, normalized
+                  const raw = Array.isArray(data?.waitingGroups) ? data.waitingGroups : [];
+
+                  // sort by request time (supports requestedAt | timestamp)
+                  const waiters = raw
+                    .map((g, i) => ({
+                      ...g,
+                      _idx: i,
+                      _ts: new Date(g.requestedAt || g.timestamp || 0).getTime()
+                    }))
+                    .sort((a, b) => a._ts - b._ts);
+
+                  const pre = data?.calculatedAvailability?.waitTimes; // preferred ETA source if present
+                  const AVG = (window.TENNIS_CONFIG?.TIMING?.AVG_GAME_TIME_MIN) || 75;
+                  const etaForIndex = (idx) =>
+                    Array.isArray(pre) && typeof pre[idx] === 'number' ? pre[idx] : idx * AVG;
+
+                  // concise console snapshot (first up to 5)
+                  console.groupCollapsed(
+                    '[CourtBoard][Waitlist] len=%d, hasPre=%s',
+                    waiters.length,
+                    Array.isArray(pre)
+                  );
+                  console.table(
+                    waiters.slice(0, 5).map((g, i) => ({
+                      pos: i + 1,
+                      players: (g.players || []).map(p => p.name).join(', '),
+                      guests: g.guests || 0,
+                      requestedAt: g.requestedAt || g.timestamp || '(missing)',
+                      ts: g._ts || '(no ts)',
+                      ETA_min: Math.max(0, Math.round(etaForIndex(i)))
+                    }))
+                  );
+                  console.groupEnd();
+                } catch (e) {
+                  console.warn('[CourtBoard][Waitlist] debug failed', e);
+                }
+              })();
+              
+              // --- WAITLIST READ DEBUG (no UI change) ---
+              try {
+                const U = window.APP_UTILS;
+                const data = U.readDataSafe(); // fresh, normalized snapshot
+                const raw = Array.isArray(data?.waitingGroups) ? data.waitingGroups : [];
+                const waiters = raw
+                  .map((g, i) => ({
+                    pos: i + 1,
+                    players: (g.players || []).map(p => p.name).join(', '),
+                    guests: g.guests || 0,
+                    requestedAt: g.requestedAt || g.timestamp || '(missing)'
+                  }));
+
+                console.groupCollapsed('[CourtBoard] waitlist read: len=%d', waiters.length);
+                console.table(waiters.slice(0, 5));
+                console.groupEnd();
+              } catch (e) {
+                console.warn('[CourtBoard] waitlist read debug failed', e);
+              }
+              
               if (!data || typeof data !== 'object') {
                 console.warn('Invalid data format in display monitor');
                 setCourts(Array(CONSTANTS.COURT_COUNT).fill(null));
@@ -1796,6 +2003,8 @@
               }
               
               const validatedData = DataValidation.sanitizeCourtData(data);
+              console.log('[BOARD DEBUG] loadData - original waitingGroups:', data.waitingGroups?.length || 0);
+              console.log('[BOARD DEBUG] loadData - validated waitingGroups:', validatedData.waitingGroups?.length || 0);
               
               const maxDuration = CONSTANTS.MAX_PLAY_DURATION_MS;
               let hasChanges = false;
@@ -1835,7 +2044,11 @@
             }
               
               setCourts(validatedData.courts);
-              setWaitingGroups(validatedData.waitingGroups);
+              const normalizedWaitlist = normalizeWaitingGroups(data);
+              console.log('[BOARD DEBUG] normalizeWaitingGroups result:', normalizedWaitlist);
+              // Ensure renderer consumes the normalized, sorted waitlist
+              data.waitingGroups = normalizedWaitlist;
+              setWaitingGroups(normalizedWaitlist);
               setLastUpdate(new Date());
             } else {
               setCourts(Array(CONSTANTS.COURT_COUNT).fill(null));
@@ -1847,10 +2060,8 @@
             setWaitingGroups([]);
           }
         }, []);
-        
-        // Expose loadData as refreshBoard for coalescer
-        const refreshBoard = loadData;
-        window.refreshBoard = refreshBoard;
+
+        window.refreshBoard = loadData;
 
         // STEP 11: Event-driven updates with increased frequency
         useEffect(() => {
@@ -1880,6 +2091,8 @@
           document.removeEventListener?.('DATA_UPDATED', scheduleBoardRefresh);
           document.addEventListener('tennisDataUpdate', scheduleBoardRefresh);
           document.addEventListener('DATA_UPDATED', scheduleBoardRefresh);
+          window.addEventListener('BLOCKS_UPDATED', scheduleBoardRefresh, { passive: true });
+          document.addEventListener('BLOCKS_UPDATED', scheduleBoardRefresh, { passive: true });
           
           // Increased polling frequency for immediate updates
           const interval = addTimer(setInterval(loadData, CONSTANTS.POLL_INTERVAL_MS));
@@ -1950,6 +2163,10 @@
         const _statuses = A.getCourtStatuses({ data, now, blocks, wetSet }) || [];
         const statusByCourt = Object.fromEntries(_statuses.map(s => [s.courtNumber, s.status]));
         const selectableByCourt = Object.fromEntries(_statuses.map(s => [s.courtNumber, s.selectable]));
+        const statusObjectByCourt = Object.fromEntries(_statuses.map(s => [s.courtNumber, s]));
+
+        // Use state for waiting groups (independent of court availability)
+        const hasWaiting = waitingGroups.length > 0;
 
         return (
           <div className="h-screen min-h-screen bg-gradient-to-br from-slate-700 to-slate-600 p-4 text-white flex flex-col">
@@ -1957,7 +2174,7 @@
               <div className="w-full flex justify-center">
                 <div className="flex items-center relative">
                   
-                  {waitingGroups.length > 0 && (
+                  {hasWaiting && (
                     <div className="absolute left-[-140px] lg:left-[-100px] xl:left-[-140px]">
                       <svg width="40" height="40" className="lg:w-20 lg:h-20 xl:w-32 xl:h-32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                          
@@ -1999,6 +2216,7 @@
                           formatPlayerName={formatPlayerDisplayName}
                           statusByCourt={statusByCourt}
                           selectableByCourt={selectableByCourt}
+                          statusObjectByCourt={statusObjectByCourt}
                           data={data}
                         />
                       </div>
@@ -2021,6 +2239,7 @@
                             formatPlayerName={formatPlayerDisplayName}
                             statusByCourt={statusByCourt}
                             selectableByCourt={selectableByCourt}
+                            statusObjectByCourt={statusObjectByCourt}
                             data={data}
                           />
                         </div>
@@ -2139,7 +2358,7 @@
                     })()}
                     
                     {/* Mobile waiting list section - only show if groups waiting */}
-                    {waitingGroups.length > 0 && (
+                    {hasWaiting && (
                       <div className="mobile-waiting-section">
                         <WaitingList 
                           waitingGroups={waitingGroups} 
@@ -2196,8 +2415,8 @@
       position: fixed;
       top: 10px;
       right: 10px;
-      width: 320px;
-      max-height: 400px;
+      width: 350px;
+      max-height: 500px;
       background: rgba(0, 0, 0, 0.85);
       color: #0f0;
       font-family: 'Courier New', monospace;
@@ -2206,10 +2425,18 @@
       border-radius: 4px;
       overflow-y: auto;
       z-index: 99999;
-      pointer-events: none;
+      pointer-events: auto;
       border: 1px solid #0f0;
     `;
-    debugPanel.innerHTML = '<div style="color: #ff0; margin-bottom: 5px;">DEBUG MODE - Events Log</div><div id="debugContent"></div>';
+    debugPanel.innerHTML = `
+      <div style="color: #ff0; margin-bottom: 5px;">DEBUG MODE - Events Log</div>
+      <div style="margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 8px;">
+        <button id="runSelfTests" style="background: #333; color: #0f0; border: 1px solid #0f0; padding: 4px 8px; border-radius: 3px; font-family: inherit; font-size: 10px; cursor: pointer;">Run self-tests</button>
+        <span style="color: #666; font-size: 10px; margin-left: 8px;">Press 't' to run</span>
+        <div id="selfTestResults" style="margin-top: 5px; font-size: 10px;"></div>
+      </div>
+      <div id="debugContent"></div>
+    `;
     document.body.appendChild(debugPanel);
 
     const updateDebugPanel = () => {
@@ -2228,6 +2455,88 @@
         </div>`;
       }).join('');
     };
+
+    // Safe wrapper for self-tests
+    function runSelfTestsSafe() {
+      const fn = window.Tennis?.selfTest?.runAll;
+      if (typeof fn !== 'function') {
+        return {
+          passed: 0, failed: 1,
+          results: [{ name: 'SelfTest not available', ok: false, notes: 'Tennis.selfTest.runAll missing' }]
+        };
+      }
+      try { return fn(); }
+      catch (e) {
+        return {
+          passed: 0, failed: 1,
+          results: [{ name: 'Run failed', ok: false, notes: String(e?.message || e) }]
+        };
+      }
+    }
+
+    function renderSelfTestResults(result) {
+      const resultsDiv = document.getElementById('selfTestResults');
+      if (!resultsDiv) return;
+      
+      const timestamp = new Date().toLocaleTimeString();
+      const passed = result.passed || 0;
+      const failed = result.failed || 0;
+      
+      // Summary with color coding
+      const summaryColor = failed > 0 ? '#f00' : '#0f0';
+      let html = `<div style="color: ${summaryColor}; font-weight: bold;">${passed} passed / ${failed} failed</div>`;
+      html += `<div style="color: #666; font-size: 9px;">Last run: ${timestamp}</div>`;
+      
+      // Compact table
+      if (result.results && result.results.length > 0) {
+        html += '<div style="margin-top: 5px; max-height: 150px; overflow-y: auto;">';
+        html += '<table style="width: 100%; font-size: 9px; border-collapse: collapse;">';
+        html += '<tr style="color: #ff0;"><th style="text-align: left; padding: 2px;">Test</th><th style="text-align: center; padding: 2px;">OK</th><th style="text-align: left; padding: 2px;">Notes</th></tr>';
+        
+        result.results.forEach(test => {
+          const okColor = test.ok ? '#0f0' : '#f00';
+          const okText = test.ok ? '✓' : '✗';
+          html += `<tr style="border-top: 1px solid #333;">`;
+          html += `<td style="padding: 2px; color: #fff;">${test.name || test.Test || ''}</td>`;
+          html += `<td style="padding: 2px; text-align: center; color: ${okColor};">${okText}</td>`;
+          html += `<td style="padding: 2px; color: #aaa;">${(test.notes || test.Notes || '').slice(0, 30)}${(test.notes || test.Notes || '').length > 30 ? '...' : ''}</td>`;
+          html += `</tr>`;
+        });
+        html += '</table></div>';
+      }
+      
+      resultsDiv.innerHTML = html;
+    }
+
+    let running = false;
+    async function handleRunSelfTests() {
+      if (running) return;
+      running = true;
+      try {
+        const resultsDiv = document.getElementById('selfTestResults');
+        if (resultsDiv) {
+          resultsDiv.innerHTML = '<div style="color: #ff0;">Running tests...</div>';
+        }
+        const result = await runSelfTestsSafe();
+        renderSelfTestResults(result);
+      } finally {
+        running = false;
+      }
+    }
+    
+    // Button click handler
+    const runButton = document.getElementById('runSelfTests');
+    if (runButton) {
+      runButton.addEventListener('click', handleRunSelfTests);
+    }
+    
+    // Keyboard shortcut (t key)
+    window.addEventListener('keydown', (e) => {
+      if ((e.key || '').toLowerCase() === 't') {
+        e.preventDefault();
+        handleRunSelfTests();
+      }
+    }, { passive: false });
 
     // Update every 500ms
     setInterval(updateDebugPanel, 500);

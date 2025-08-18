@@ -12,7 +12,8 @@
       SETTINGS: 'tennisClubSettings',
       BLOCKS: 'courtBlocks',
       HISTORICAL_GAMES: 'tennisHistoricalGames',
-      UPDATE_TICK: 'tennisDataUpdateTick'
+      UPDATE_TICK: 'tennisDataUpdateTick',
+      MEMBER_ID_MAP: 'tennisMemberIdMap' // NEW: normalizedName[#clubNumber] -> memberId
     },
 
     // Delegate to APP_UTILS functions
@@ -43,6 +44,16 @@
     },
 
     readDataSafe: function() {
+      // Check if in dev mode (debug flag or immutable reads config)
+      const isDevMode = location.search.includes('debug=1') || 
+                       window.Tennis?.Config?.Dev?.IMMUTABLE_READS !== false;
+      
+      if (isDevMode) {
+        // In dev mode, return a frozen clone to catch mutations
+        return this.deepFreeze(this.readDataClone());
+      }
+      
+      // Production behavior: delegate to APP_UTILS or fallback
       if (window.APP_UTILS && window.APP_UTILS.readDataSafe) {
         return window.APP_UTILS.readDataSafe();
       }
@@ -83,10 +94,56 @@
       return allKeys;
     },
 
+    // Deep freeze helper (recursively freeze objects/arrays; ignore primitives/Dates/functions)
+    deepFreeze: function(obj) {
+      if (obj === null || typeof obj !== 'object') return obj;
+      if (obj instanceof Date || typeof obj === 'function') return obj;
+      
+      // Freeze the object itself
+      Object.freeze(obj);
+      
+      // Recursively freeze properties
+      Object.values(obj).forEach(this.deepFreeze.bind(this));
+      
+      return obj;
+    },
+
+    // Deep clone for writers - blessed API for mutations
+    readDataClone: function() {
+      const data = this.readJSON(this.KEYS.DATA) || this.getEmptyData();
+      
+      // Use structuredClone if available, fallback to JSON clone
+      const cloned = typeof structuredClone === 'function' 
+        ? structuredClone(data)
+        : JSON.parse(JSON.stringify(data));
+      
+      // Ensure proper structure on the clone
+      if (!Array.isArray(cloned.courts)) {
+        cloned.courts = Array.from({ length: 12 }, () => ({ history: [], current: null }));
+      }
+      
+      // Ensure each court has proper structure
+      cloned.courts = cloned.courts.map(court => court ? {
+        history: Array.isArray(court.history) ? court.history : [],
+        current: court.current || null,
+        ...court
+      } : { history: [], current: null });
+      
+      if (!Array.isArray(cloned.waitingGroups)) {
+        cloned.waitingGroups = [];
+      }
+      
+      if (!Array.isArray(cloned.recentlyCleared)) {
+        cloned.recentlyCleared = [];
+      }
+      
+      return cloned;
+    },
+
     };
 
   // expose constants so callers can use Tennis.Storage.STORAGE / EVENTS
-  window.Tennis.Storage.STORAGE = window.Tennis.Storage.STORAGE || window.APP_UTILS.STORAGE;
+  window.Tennis.Storage.STORAGE = window.Tennis.Storage.KEYS;
   window.Tennis.Storage.EVENTS = window.Tennis.Storage.EVENTS || window.APP_UTILS.EVENTS;
 
 })();

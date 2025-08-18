@@ -33,15 +33,19 @@
           return { valid: false, error: `Player ${i + 1} must have a valid name` };
         }
         
-        if (!player.id || typeof player.id !== 'string') {
-          return { valid: false, error: `Player ${i + 1} must have a valid ID` };
-        }
+        // ID is optional - we can work with just names
+        // if (!player.id || typeof player.id !== 'string') {
+        //   return { valid: false, error: `Player ${i + 1} must have a valid ID` };
+        // }
       }
       
-      // Check for duplicate player IDs
-      const playerIds = group.map(p => p.id);
-      const uniqueIds = new Set(playerIds);
-      if (playerIds.length !== uniqueIds.size) {
+      // Check for duplicate players (by ID if available, otherwise by normalized name)
+      const playerKeys = group.map(p => {
+        if (p.id) return `id:${p.id}`;
+        return `name:${p.name.trim().toLowerCase()}`;
+      });
+      const uniqueKeys = new Set(playerKeys);
+      if (playerKeys.length !== uniqueKeys.size) {
         return { valid: false, error: 'Duplicate players are not allowed in the same group' };
       }
       
