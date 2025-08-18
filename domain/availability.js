@@ -5,6 +5,23 @@
   window.Tennis = window.Tennis || {};
   window.Tennis.Domain = window.Tennis.Domain || {};
 
+  // Helper functions for robust date/block handling
+  function coerceDate(d) {
+    // Accept Date or string; never NaN
+    if (d instanceof Date) return d;
+    const parsed = new Date(d);
+    return isNaN(parsed.getTime()) ? new Date() : parsed;
+  }
+
+  function isOvertime(session, now) {
+    if (!session?.endTime) return false;
+    return coerceDate(session.endTime) <= now;   // strict "ended before or at now"
+  }
+
+  function normalizeBlocks(arr) {
+    return Array.isArray(arr) ? arr : [];
+  }
+
   // Court availability utilities
   const Availability = {
     // Get list of free courts based on current data, time, blocks, and wet conditions
@@ -12,12 +29,11 @@
       if (!data || !data.courts || !Array.isArray(data.courts)) {
         throw new Error('Invalid data or courts array provided');
       }
-      if (!now || !Date.prototype.isPrototypeOf(now)) {
-        throw new Error('Invalid current time provided');
-      }
-      if (!Array.isArray(blocks)) {
-        throw new Error('Blocks must be an array');
-      }
+      
+      // Use hardened normalization
+      now = coerceDate(now);
+      blocks = normalizeBlocks(blocks);
+      wetSet = wetSet instanceof Set ? wetSet : new Set();
       
       const freeCourts = [];
       
@@ -49,14 +65,15 @@
           continue;
         }
         
-        // Check if court is currently blocked
+        // Check if court is currently blocked using hardened date handling
         const isBlocked = blocks.some(block => {
-          if (block.courtNumber !== courtNumber) return false;
+          const courtNum = Number(block.courtNumber || block.court);
+          if (!courtNum || courtNum !== courtNumber) return false;
           
-          const blockStart = new Date(block.startTime);
-          const blockEnd = new Date(block.endTime);
+          const blockStart = coerceDate(block.startTime || block.start);
+          const blockEnd = coerceDate(block.endTime || block.end);
           
-          return now >= blockStart && now < blockEnd;
+          return blockStart <= now && now < blockEnd;
         });
         
         if (isBlocked) {
@@ -151,7 +168,15 @@
   function getFreeCourtsInfo({ data, now, blocks, wetSet }) {
     const total = (window.Tennis?.Config?.Courts?.TOTAL_COUNT) || 12;
     const all   = Array.from({ length: total }, (_, i) => i + 1);
-    const wet   = Array.from(new Set([...(wetSet || new Set())])).sort((a,b)=>a-b);
+    
+    // Normalize inputs for consistent handling
+    now = coerceDate(now);
+    blocks = normalizeBlocks(blocks);
+    wetSet = wetSet instanceof Set ? wetSet : new Set();
+
+    const free = [];
+    const overtime = [];
+    const wet = Array.from(wetSet).sort((a,b)=>a-b);
 
     // DEBUG: Check what data we're actually getting
     const dataSnapshot = {
@@ -163,36 +188,57 @@
       firstCourtCurrent: data?.courts?.[0]?.current || null
     };
 
-    // Use existing API for free list (honors wetSet/blocks per current logic)
-    const arr  = (window.Tennis.Domain.availability || window.Tennis.Domain.Availability)
-                   .getFreeCourts({ data, now, blocks, wetSet }) || [];
-    const free = Array.isArray(arr) ? arr.slice().sort((a,b)=>a-b) : (arr.free || []);
-    
+    // Process each court individually for deterministic classification
+    for (let i = 0; i < (data?.courts?.length || 0); i++) {
+      const n = i + 1;
+
+      // if blocked/wet, skip it from free/overtime classification entirely
+      const isWet = wetSet.has(n);
+      const isBlocked = blocks.some(b => {
+        const courtNum = Number(b.courtNumber || b.court);
+        if (!courtNum || courtNum !== n) return false;
+        const start = coerceDate(b.startTime || b.start);
+        const end = coerceDate(b.endTime || b.end);
+        return start <= now && now < end;
+      });
+      
+      if (isWet || isBlocked) continue;
+
+      const court = data.courts[i];
+      const current = court?.current;
+      
+      if (!current) { 
+        free.push(n); 
+        continue; 
+      }
+
+      if (isOvertime(current, now)) {
+        overtime.push(n);
+      }
+      // If not overtime and has current session, it's occupied (not free or overtime)
+    }
+
     // DEBUG: Log when we get suspicious results
     if (free.length >= 11) {
       console.log('🔍 getFreeCourtsInfo - ALL COURTS FREE detected:', {
         dataSnapshot,
         freeCount: free.length,
+        overtimeCount: overtime.length,
+        wetCount: wet.length,
         callerStack: new Error().stack.split('\n').slice(1, 4)
       });
     }
+
     const freeSet = new Set(free);
-
-    // NEW: overtime detection
-    const courts = Array.isArray(data?.courts) ? data.courts : [];
-    const overtime = [];
-    for (let n = 1; n <= total; n++) {
-      const c = courts[n - 1];
-      const endRaw = c?.current?.endTime;
-      if (!endRaw) continue;
-      const end = new Date(endRaw);
-      if (end instanceof Date && !isNaN(end) && end <= now) {
-        overtime.push(n);
-      }
-    }
-
-    const occupied = all.filter(n => !freeSet.has(n)).sort((a,b)=>a-b);
-    return { free, occupied, wet, overtime, meta: { total, overtimeCount: overtime.length } };
+    const occupied = all.filter(n => !freeSet.has(n) && !overtime.includes(n) && !wet.includes(n)).sort((a,b)=>a-b);
+    
+    return { 
+      free: free.sort((a,b)=>a-b), 
+      occupied, 
+      wet, 
+      overtime: overtime.sort((a,b)=>a-b), 
+      meta: { total, overtimeCount: overtime.length } 
+    };
   }
 
   // Attach getNextFreeTimes to the Availability API

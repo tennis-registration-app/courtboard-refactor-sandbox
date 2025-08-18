@@ -96,11 +96,27 @@
         return { success: false, error: 'Missing court number or group data' };
       }
 
-      // Reuse the same data object from the strict check above - no duplicate reads!
-      const waiting = Array.isArray(data.waitingGroups) ? data.waitingGroups : [];
-      
       // Extract players from group (handle both array and object formats)
       const players = Array.isArray(group) ? group : (group?.players || []);
+      
+      // 1) HARD CONFLICTS FIRST - Check for duplicates before waitlist priority
+      const R = T.Domain.roster || T.Domain.Roster;
+      const groupWithIds = (R?.enrichPlayersWithIds)
+        ? R.enrichPlayersWithIds(players, window.__memberRoster || [])
+        : players;
+
+      for (const p of groupWithIds) {
+        const engagement = R?.findEngagementFor ? R.findEngagementFor(p, data) : null;
+        if (engagement?.type === 'playing') {
+          return { success: false, error: `${p.name || p} is already playing on Court ${engagement.court}` };
+        }
+        if (engagement?.type === 'waitlist') {
+          return { success: false, error: `${p.name || p} is already on the waitlist (position ${engagement.position})` };
+        }
+      }
+      
+      // 2) THEN waitlist priority check
+      const waiting = Array.isArray(data.waitingGroups) ? data.waitingGroups : [];
       
       console.log('[assignCourt] Waitlist check:', { 
         waitingLength: waiting.length, 
