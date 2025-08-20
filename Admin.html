@@ -926,6 +926,45 @@ const CourtStatusGrid = ({ courts, courtBlocks, selectedDate, onClearCourt, onMo
     setShowActions(null);
   };
 
+  const handleSaveGame = async (updatedGame) => {
+    try {
+      // Get current data
+      const S = window.Tennis?.Storage;
+      const data = S?.readDataClone ? S.readDataClone() : structuredClone(S.readDataSafe());
+      
+      // Find and update the court with the edited game
+      const courtIndex = updatedGame.courtNumber - 1;
+      if (data.courts && data.courts[courtIndex] && data.courts[courtIndex].current) {
+        // Update the game details
+        data.courts[courtIndex].current = {
+          ...data.courts[courtIndex].current,
+          players: updatedGame.players,
+          startTime: updatedGame.startTime,
+          endTime: updatedGame.endTime,
+          duration: updatedGame.duration
+        };
+        
+        // Save the updated data
+        const DS = window.Tennis?.DataStore || window.DataStore;
+        if (DS?.set) {
+          await DS.set(S.STORAGE.DATA, data);
+          Tennis?.UI?.toast?.('Game updated successfully', { type: 'success' });
+        } else {
+          // Fallback to direct storage
+          S.writeJSON(S.STORAGE.DATA, data);
+          window.dispatchEvent(new Event('DATA_UPDATED'));
+          window.dispatchEvent(new Event('tennisDataUpdate'));
+        }
+      }
+      
+      setEditingGame(null);
+      setRefreshKey(prev => prev + 1);
+    } catch (error) {
+      console.error('Error saving game:', error);
+      Tennis?.UI?.toast?.('Failed to save game', { type: 'error' });
+    }
+  };
+
 const handleAllCourtsDry = async () => {
   // If parent provided a callback, use it
   if (onClearAllWetCourts) {
@@ -5805,6 +5844,32 @@ const existingBlocks = courts.filter(c => c?.blocked).map((c, i) => ({
     await dataStore.set(TENNIS_CONFIG.STORAGE.SETTINGS_KEY, newSettings, { immediate: true });
     onNotification('Ball price updated', 'success');
   };
+
+  const updateWeekdayGuestFee = async (fee) => {
+    const newSettings = { 
+      ...settings, 
+      guestFees: {
+        ...(settings.guestFees || {}),
+        weekday: parseFloat(fee)
+      }
+    };
+    setSettings(newSettings);
+    await dataStore.set(TENNIS_CONFIG.STORAGE.SETTINGS_KEY, newSettings, { immediate: true });
+    onNotification('Weekday guest fee updated', 'success');
+  };
+
+  const updateWeekendGuestFee = async (fee) => {
+    const newSettings = { 
+      ...settings, 
+      guestFees: {
+        ...(settings.guestFees || {}),
+        weekend: parseFloat(fee)
+      }
+    };
+    setSettings(newSettings);
+    await dataStore.set(TENNIS_CONFIG.STORAGE.SETTINGS_KEY, newSettings, { immediate: true });
+    onNotification('Weekend guest fee updated', 'success');
+  };
 // AdminPanelV2 rendering complete
   return (
     <div className="min-h-screen bg-gray-100">
@@ -6207,7 +6272,8 @@ const existingBlocks = courts.filter(c => c?.blocked).map((c, i) => ({
           <div className="bg-white rounded-lg shadow-sm p-6">
             <h3 className="text-lg font-semibold text-gray-800 mb-4">System Settings</h3>
             
-            <div className="space-y-4">
+            <div className="space-y-6">
+              {/* Tennis Ball Price */}
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
                   Tennis Ball Price
@@ -6221,6 +6287,46 @@ const existingBlocks = courts.filter(c => c?.blocked).map((c, i) => ({
                     onChange={(e) => updateBallPrice(e.target.value)}
                     className="w-32 p-2 border rounded"
                   />
+                </div>
+              </div>
+
+              {/* Guest Fees Section */}
+              <div className="border-t pt-6">
+                <h4 className="text-md font-medium text-gray-800 mb-4">Guest Fees</h4>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Weekday Guest Fee */}
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Weekday Guest Fee (Mon-Fri)
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">$</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={settings.guestFees?.weekday || 15.00}
+                        onChange={(e) => updateWeekdayGuestFee(e.target.value)}
+                        className="w-32 p-2 border rounded"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Weekend Guest Fee */}
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Weekend Guest Fee (Sat-Sun)
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">$</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={settings.guestFees?.weekend || 20.00}
+                        onChange={(e) => updateWeekendGuestFee(e.target.value)}
+                        className="w-32 p-2 border rounded"
+                      />
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -6781,33 +6887,6 @@ const GuestChargeLog = ({ charges, dateRange }) => {
       <div className="flex justify-between items-center mb-4">
         <h3 className="text-lg font-semibold">Guest Charge Log</h3>
         <div className="flex gap-2">
-          <button
-            onClick={async () => {
-              console.log('🔍 DEBUG: Manual localStorage check...');
-              const localData = localStorage.getItem(TENNIS_CONFIG.STORAGE.GUEST_CHARGES_KEY);
-              console.log('🔍 Raw localStorage data:', localData);
-              if (localData) {
-                const parsed = JSON.parse(localData);
-                console.log('🔍 Parsed data:', parsed);
-                console.log('🔍 Number of charges:', parsed.length);
-                parsed.forEach((charge, i) => {
-                  console.log(`🔍 Charge ${i + 1}:`, charge);
-                });
-              } else {
-                console.log('🔍 No data in localStorage for key:', TENNIS_CONFIG.STORAGE.GUEST_CHARGES_KEY);
-              }
-              
-              // Check dataStore too
-              const dataStoreData = await dataStore.get(TENNIS_CONFIG.STORAGE.GUEST_CHARGES_KEY);
-              console.log('🔍 DataStore data:', dataStoreData);
-              
-              // Check current component state
-              console.log('🔍 Current component state charges:', charges.length);
-            }}
-            className="flex items-center gap-2 px-3 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 text-sm"
-          >
-            🔍 Debug
-          </button>
           <button
             onClick={handleExport}
             className="flex items-center gap-2 px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"

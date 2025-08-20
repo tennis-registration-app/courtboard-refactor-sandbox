@@ -239,9 +239,17 @@
         };
       });
       
+      let replacedGroup = null;
+      
       // If court has an existing game (overtime), preserve it in history before replacing
       if (court.current) {
         const existingGame = court.current;
+        
+        // Capture replaced group for UI
+        replacedGroup = {
+          players: existingGame.players,
+          endTime: existingGame.endTime
+        };
         const nowISO = now.toISOString();
         
         console.log('[assignCourt] BUMPING existing game:', {
@@ -305,7 +313,7 @@
       // Persist through guarded path
       await DS.set(S.STORAGE.DATA, data);
 
-      return { success: true, courtNumber };
+      return { success: true, courtNumber, replacedGroup };
     } catch (err) {
       return { success: false, error: String(err?.message || err) };
     }

@@ -372,7 +372,8 @@ Tennis.UI.toast = (msg, opts={}) =>
                      : `${minutes} min`;
 
       if (el) {
-        el.textContent = `Estimated wait if you join now: ${label}`;
+        // Hide the ETA preview text completely
+        el.textContent = '';
         el.setAttribute('data-eta-minutes', minutes ?? '');
       } else {
         dbg('[Registration ETA preview]', { position, minutes, label, freeCount, qLen });
@@ -415,12 +416,12 @@ Tennis.UI.toast = (msg, opts={}) =>
 (function registerAutoClear() {
   const DEBUG = false;
   const dbg = (...a) => DEBUG && console.log(...a);
-  const run = () => {
+  const run = async () => {
     try {
       const fn = window.__autoClearOverdueSessions;
       if (typeof fn === 'function') {
-        const n = fn(); // may clear 0+
-        dbg('[AutoClear@Registration] cleared', n, 'overdue sessions');
+        const n = await fn(); // may clear 0+ (now handles both overdue and block conflicts)
+        dbg('[AutoClear@Registration] cleared/bumped', n, 'sessions');
       }
     } catch (e) { /* swallow in prod */ }
   };
@@ -2187,46 +2188,58 @@ const SuccessScreen = ({
   }, []);
   
   const handleBallPurchase = React.useCallback(async () => {
-    // Process the purchase
-    if (ballPurchaseOption === 'charge') {
-      setPurchaseDetails({
-        type: 'single',
-        amount: ballPrice,
-        accounts: [getLastFourDigits(currentGroup[0]?.memberNumber)]
-      });
-    } else {
-      setPurchaseDetails({
-        type: 'split',
-        amount: splitPrice,
-        accounts: currentGroup.filter(p => !p.isGuest).map(p => getLastFourDigits(p.memberNumber))
-      });
+    try {
+      console.log('[handleBallPurchase] Starting purchase process:', { ballPurchaseOption, ballPrice, currentGroup });
+      
+      // Process the purchase
+      if (ballPurchaseOption === 'charge') {
+        setPurchaseDetails({
+          type: 'single',
+          amount: ballPrice,
+          accounts: [getLastFourDigits(currentGroup[0]?.memberNumber)]
+        });
+      } else {
+        setPurchaseDetails({
+          type: 'split',
+          amount: splitPrice,
+          accounts: currentGroup.filter(p => !p.isGuest).map(p => getLastFourDigits(p.memberNumber))
+        });
+      }
+      
+      // Calculate nonGuestPlayers fresh in the callback
+      const currentNonGuestPlayers = currentGroup.filter(p => !p.isGuest).length;
+      
+      // Save purchase to localStorage
+      const purchase = {
+        id: Date.now(),
+        timestamp: new Date().toISOString(),
+        type: ballPurchaseOption,
+        amount: ballPurchaseOption === 'charge' ? ballPrice : splitPrice,
+        totalAmount: ballPurchaseOption === 'charge' ? ballPrice : splitPrice * currentNonGuestPlayers,
+        players: ballPurchaseOption === 'charge' 
+          ? [currentGroup[0]] 
+          : currentGroup.filter(p => !p.isGuest),
+        courtNumber: justAssignedCourt
+      };
+      
+      console.log('[handleBallPurchase] Purchase object:', purchase);
+
+      // Get existing purchases and save them directly to the dedicated key
+      const existingPurchases = await dataStore.get('tennisBallPurchases') || [];
+      existingPurchases.push(purchase);
+      
+      // Save purchases to the dedicated key (not embedded in main data)
+      await dataStore.set('tennisBallPurchases', existingPurchases, { immediate: true });
+      
+      console.log('[handleBallPurchase] Purchase saved successfully');
+
+      setBallsPurchased(true);
+      setShowBallPurchaseModal(false);
+    } catch (error) {
+      console.error('[handleBallPurchase] Error processing purchase:', error);
+      // You might want to show an error message to the user here
     }
-    
-// Save purchase to localStorage
-const purchase = {
-  id: Date.now(),
-  timestamp: new Date().toISOString(),
-  type: ballPurchaseOption,
-  amount: ballPurchaseOption === 'charge' ? ballPrice : splitPrice,
-  totalAmount: ballPurchaseOption === 'charge' ? ballPrice : splitPrice * nonGuestPlayers,
-  players: ballPurchaseOption === 'charge' 
-    ? [currentGroup[0]] 
-    : currentGroup.filter(p => !p.isGuest),
-  courtNumber: justAssignedCourt
-};
-
-// Get existing purchases
-const existingPurchases = await dataStore.get('tennisBallPurchases') || [];
-existingPurchases.push(purchase);
-
-// read current, modify in-memory, then persist via the service
-const data = Tennis.Storage.readDataSafe();
-data.tennisBallPurchases = existingPurchases;
-await TennisDataService.saveData(data);
-
-setBallsPurchased(true);
-setShowBallPurchaseModal(false);
-}, [ballPurchaseOption, ballPrice, splitPrice, currentGroup, getLastFourDigits, justAssignedCourt]);
+  }, [ballPurchaseOption, ballPrice, splitPrice, currentGroup, getLastFourDigits, justAssignedCourt]);
  
 // Fixed layout card component
   const SuccessCard = ({ headerContent, mainContent, footerContent }) => (
@@ -2522,8 +2535,59 @@ const CourtSelectionScreen = ({
   onJoinWaitlist,
   onAssignNext,
   onGoBack,
-  onStartOver
+  onStartOver,
+  currentGroup = [] // Add currentGroup prop to determine duration
 }) => {
+  const [blockWarning, setBlockWarning] = useState(null);
+  const [pendingCourtNumber, setPendingCourtNumber] = useState(null);
+  
+  // Determine session duration based on group size
+  const getSessionDuration = (group) => {
+    const playerCount = group?.length || 0;
+    return playerCount >= 4 ? 90 : 60; // 90 minutes for doubles (4+ players), 60 for singles
+  };
+  
+  // Handle court selection with block checking
+  const handleCourtClick = (courtNumber) => {
+    const duration = getSessionDuration(currentGroup);
+    const warning = getUpcomingBlockWarning(courtNumber, duration);
+    
+    if (warning) {
+      if (warning.type === 'blocked') {
+        // Court is blocked - show warning but don't allow proceed
+        setBlockWarning(warning);
+        setPendingCourtNumber(null);
+      } else {
+        // Court has limited time - show confirmation
+        setBlockWarning(warning);
+        setPendingCourtNumber(courtNumber);
+      }
+    } else {
+      // No block issues - proceed normally
+      onCourtSelect(courtNumber);
+    }
+  };
+  
+  // Confirm selection despite limited time
+  const handleConfirmSelection = () => {
+    if (pendingCourtNumber) {
+      onCourtSelect(pendingCourtNumber);
+    }
+    setBlockWarning(null);
+    setPendingCourtNumber(null);
+  };
+  
+  // Cancel selection
+  const handleCancelSelection = () => {
+    setBlockWarning(null);
+    setPendingCourtNumber(null);
+  };
+  
+  // Get warning info for a court to show visual indicators
+  const getCourtWarningInfo = (courtNumber) => {
+    const duration = getSessionDuration(currentGroup);
+    return getUpcomingBlockWarning(courtNumber, duration);
+  };
   return (
     <div className="w-full h-full min-h-screen bg-gradient-to-br from-green-50 to-blue-50 p-4 sm:p-8 flex items-center justify-center">
       <div className="bg-white rounded-2xl shadow-2xl p-4 sm:p-8 w-full max-w-4xl relative">
@@ -2536,21 +2600,44 @@ const CourtSelectionScreen = ({
             All courts are occupied. You may claim an overtime court.
           </p>
         )}
+        
 
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 sm:gap-6 mb-16 sm:mb-20">
-          {availableCourts.map(courtNum => (
-            <button
-              key={courtNum}
-              onClick={() => onCourtSelect(courtNum)}
-              className={`p-6 sm:p-8 rounded-xl text-xl sm:text-2xl font-bold text-white transition-all transform hover:scale-105 shadow-lg ${
-                showingOvertimeCourts 
-                  ? "bg-gradient-to-r from-green-600 to-green-700 hover:from-green-700 hover:to-green-800" 
-                  : "bg-gradient-to-r from-green-400 to-green-500 hover:from-green-500 hover:to-green-600"
-              }`}
-            >
-              Court {courtNum}
-            </button>
-          ))}
+          {availableCourts.map(courtNum => {
+            const warningInfo = getCourtWarningInfo(courtNum);
+            const hasUpcomingBlock = warningInfo && warningInfo.type === 'limited' && warningInfo.minutesUntilBlock < 60;
+            const isBlocked = warningInfo && warningInfo.type === 'blocked';
+            
+            return (
+              <button
+                key={courtNum}
+                onClick={() => handleCourtClick(courtNum)}
+                disabled={isBlocked}
+                className={`relative p-6 sm:p-8 rounded-xl text-xl sm:text-2xl font-bold text-white transition-all transform shadow-lg ${
+                  showingOvertimeCourts 
+                    ? "bg-gradient-to-r from-green-600 to-green-700 hover:from-green-700 hover:to-green-800" 
+                    : "bg-gradient-to-r from-green-400 to-green-500 hover:from-green-500 hover:to-green-600"
+                } ${isBlocked ? 'opacity-60 cursor-not-allowed' : 'hover:scale-105'}`}
+              >
+                <div className="flex flex-col items-center justify-center h-full">
+                  <span>Court {courtNum}</span>
+                  
+                  {/* Only show notice on regular available courts (not overtime courts) and when block is within 60 minutes */}
+                  {hasUpcomingBlock && !showingOvertimeCourts && (
+                    <div className="absolute bottom-2 left-2 right-2 bg-amber-500 bg-opacity-90 text-white text-xs px-2 py-1 rounded text-center font-normal">
+                      {warningInfo.reason} begins in {warningInfo.minutesUntilBlock}m
+                    </div>
+                  )}
+                  
+                  {isBlocked && (
+                    <div className="absolute bottom-2 left-2 right-2 bg-red-500 bg-opacity-90 text-white text-xs px-2 py-1 rounded text-center font-normal">
+                      Unavailable - starts in {warningInfo.minutesUntilBlock}m
+                    </div>
+                  )}
+                </div>
+              </button>
+            );
+          })}
         </div>
 
 
@@ -2570,6 +2657,13 @@ const CourtSelectionScreen = ({
             Start Over
           </button>
         </div>
+        
+        {/* Block Warning Modal */}
+        <BlockWarningModal 
+          warning={blockWarning}
+          onConfirm={handleConfirmSelection}
+          onCancel={handleCancelSelection}
+        />
       </div>
     </div>
   );
@@ -2620,6 +2714,139 @@ const activeBlocks = TennisDataService.getActiveBlocksForCourt(courtNumber, now)
     isBlocked: false,
     isCurrent: false
   };
+};
+
+// Check for upcoming blocks that would limit playing time
+const getUpcomingBlockWarning = (courtNumber, duration = 60) => {
+  const now = new Date();
+  const sessionEndTime = new Date(now.getTime() + duration * 60 * 1000);
+  
+  try {
+    // Get all blocks from storage and filter for this court
+    const allBlocks = Tennis.Storage.readJSON(Tennis.Storage.STORAGE.BLOCKS) || [];
+    const blocks = allBlocks.filter(b => b.courtNumber === courtNumber);
+    
+    // Find the earliest block that would interfere with the session
+    const upcomingBlock = blocks
+      .filter(block => {
+        const blockStart = new Date(block.startTime);
+        const blockEnd = new Date(block.endTime);
+        
+        // Skip blocks that are currently active or already past
+        if (blockStart <= now || blockEnd <= now) return false;
+        
+        // Skip wet court blocks (they're handled separately)
+        if (block.isWetCourt) return false;
+        
+        // Block interferes if it starts before our session would naturally end
+        return blockStart < sessionEndTime;
+      })
+      .sort((a, b) => new Date(a.startTime) - new Date(b.startTime))[0];
+    
+    if (!upcomingBlock) return null;
+    
+    const blockStart = new Date(upcomingBlock.startTime);
+    const minutesUntilBlock = Math.floor((blockStart.getTime() - now.getTime()) / (60 * 1000));
+    
+    // Don't allow registration if block starts within 5 minutes
+    if (minutesUntilBlock <= 5) {
+      return {
+        type: 'blocked',
+        reason: upcomingBlock.reason,
+        startTime: upcomingBlock.startTime,
+        minutesUntilBlock
+      };
+    }
+    
+    // Warn if playing time will be limited
+    if (minutesUntilBlock < duration) {
+      return {
+        type: 'limited',
+        reason: upcomingBlock.reason,
+        startTime: upcomingBlock.startTime,
+        limitedDuration: minutesUntilBlock,
+        originalDuration: duration,
+        minutesUntilBlock
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    console.warn('Error checking upcoming blocks:', error);
+    return null;
+  }
+};
+
+// Block Warning Confirmation Modal
+const BlockWarningModal = ({ warning, onConfirm, onCancel }) => {
+  if (!warning) return null;
+  
+  const formatTime = (isoString) => {
+    return new Date(isoString).toLocaleTimeString('en-US', { 
+      hour: 'numeric', 
+      minute: '2-digit',
+      hour12: true 
+    });
+  };
+  
+  const isBlocked = warning.type === 'blocked';
+  
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6">
+        <div className="flex items-center gap-3 mb-4">
+          <span className="text-2xl">⚠️</span>
+          <h3 className="text-lg font-bold text-gray-900">
+            {isBlocked ? 'Court Unavailable' : 'Limited Playing Time'}
+          </h3>
+        </div>
+        
+        <div className="mb-6">
+          <p className="text-gray-700 mb-2">
+            This court has a <strong>{warning.reason}</strong> starting at{' '}
+            <strong>{formatTime(warning.startTime)}</strong>.
+          </p>
+          
+          {isBlocked ? (
+            <p className="text-red-600 font-medium">
+              Registration is not available as the block starts in {warning.minutesUntilBlock} minutes.
+            </p>
+          ) : (
+            <p className="text-amber-600 font-medium">
+              Your playing time will be limited to <strong>{warning.limitedDuration} minutes</strong> instead 
+              of the usual {warning.originalDuration} minutes.
+            </p>
+          )}
+        </div>
+        
+        <div className="flex gap-3">
+          {isBlocked ? (
+            <button
+              onClick={onCancel}
+              className="flex-1 px-4 py-2 bg-gray-500 text-white rounded-lg hover:bg-gray-600 transition-colors"
+            >
+              Select Different Court
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={onCancel}
+                className="flex-1 px-4 py-2 bg-gray-500 text-white rounded-lg hover:bg-gray-600 transition-colors"
+              >
+                Select Different Court
+              </button>
+              <button
+                onClick={onConfirm}
+                className="flex-1 px-4 py-2 bg-amber-500 text-white rounded-lg hover:bg-amber-600 transition-colors"
+              >
+                Proceed with {warning.limitedDuration} Minutes
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 };
 
 function ToastHost() {
@@ -6017,6 +6244,13 @@ onFocus={() => {
           }
         }
         
+        // Calculate available courts for this group
+        // For new groups not on waitlist: use standard selectable (includes overtime)
+        // For waitlist groups: use appropriate logic based on position
+        const availableCourts = groupWaitlistPosition === 0 
+          ? getAvailableCourts(false)  // New group - includes overtime courts
+          : getAvailableCourts(true);  // Waitlist group - free courts only
+        
         // Check if there are actually any courts available to select
         const hasAvailableCourts = availableCourts && availableCourts.length > 0;
         const availableCourtCount = availableCourts?.length || 0;
@@ -6092,10 +6326,12 @@ onFocus={() => {
   </button>
 </div>
 
-<div id="etaPreview"
-     aria-live="polite"
-     style={{marginTop: '8px', fontSize: '0.95rem', opacity: '0.9'}}>
-</div>
+{!showSuccess && (
+  <div id="etaPreview"
+       aria-live="polite"
+       style={{marginTop: '8px', fontSize: '0.95rem', opacity: '0.9'}}>
+  </div>
+)}
 
 
        </div>
@@ -6160,21 +6396,30 @@ onFocus={() => {
    const isFirstInWaitlist = currentGroup.some(player => isPlayerNextInWaitlist(player.id));
    
    // Check if showing overtime courts
+   // Only count truly free courts as unoccupied (not blocked or wet courts)
    const hasUnoccupiedCourts = data.courts.some((court, index) => {
      const courtNumber = index + 1;
      
-     // Check if court is blocked
+     // Check if court is blocked or wet
      const blockStatus = getCourtBlockStatus(courtNumber);
      if (blockStatus && blockStatus.isCurrent) {
        return false; // Blocked courts are not unoccupied
      }
      
-     // Check various conditions for an unoccupied court
-     return !court || // No court data
-            court.wasCleared || // Court was cleared
-            (court.current === null && court.history) || // New structure with cleared court
+     // Check if court is wet (you might have wet court logic here)
+     // Add wet court check if needed
+     
+     // Only count as unoccupied if it's truly free AND selectable
+     const isTrulyFree = !court || 
+            court.wasCleared || 
+            (court.current === null && court.history) || 
             ((!court.players || court.players.length === 0) && 
-             (!court.current || !court.current.players || court.current.players.length === 0)); // No players in either structure
+             (!court.current || !court.current.players || court.current.players.length === 0));
+             
+     // Additional check: must also be in the selectable courts list
+     const isSelectable = availableCourts.includes(courtNumber);
+     
+     return isTrulyFree && isSelectable;
    });
    const showingOvertimeCourts = availableCourts.length > 0 && !hasUnoccupiedCourts && !isSelectingDifferentCourt;
    
@@ -6188,6 +6433,7 @@ onFocus={() => {
          showingOvertimeCourts={showingOvertimeCourts}
          hasWaitingGroups={hasWaitingGroups}
          waitingGroupsCount={data.waitingGroups.length}
+         currentGroup={currentGroup}
          onCourtSelect={async (courtNum) => {
            const DEBUG_SELECT = false;
            if (DEBUG_SELECT) console.log('[SelectCourt] clicked', { courtNumber: courtNum });

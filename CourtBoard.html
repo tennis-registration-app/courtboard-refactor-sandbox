@@ -562,9 +562,12 @@
   
   <script>
   (function(){
-    // Delegate to shared auto-clear function
-    window.__autoClearOverdueSessions = (when) =>
-      window.Tennis?.Maintenance?.autoClearOverdueSessions?.(when);
+    // Delegate to shared maintenance functions  
+    window.__autoClearOverdueSessions = async (when) => {
+      const cleared = await window.Tennis?.Maintenance?.autoClearOverdueSessions?.(when) || 0;
+      const bumped = await window.Tennis?.Maintenance?.autoClearBlockConflicts?.(when) || 0;
+      return cleared + bumped;
+    };
 
     // Run once on boot, then every 5 minutes
     document.addEventListener('DOMContentLoaded', () => {
@@ -1118,6 +1121,67 @@
         };
       };
 
+      // Check for upcoming blocks that would limit playing time
+      const getUpcomingBlockWarning = (courtNumber, duration = 60) => {
+        const now = new Date();
+        const sessionEndTime = new Date(now.getTime() + duration * 60 * 1000);
+        
+        try {
+          // Get all blocks from storage and filter for this court
+          const allBlocks = Tennis.Storage.readJSON(Tennis.Storage.STORAGE.BLOCKS) || [];
+          const blocks = allBlocks.filter(b => b.courtNumber === courtNumber);
+          
+          // Find the earliest block that would interfere with the session
+          const upcomingBlock = blocks
+            .filter(block => {
+              const blockStart = new Date(block.startTime);
+              const blockEnd = new Date(block.endTime);
+              
+              // Skip blocks that are currently active or already past
+              if (blockStart <= now || blockEnd <= now) return false;
+              
+              // Skip wet court blocks (they're handled separately)
+              if (block.isWetCourt) return false;
+              
+              // Block interferes if it starts before our session would naturally end
+              return blockStart < sessionEndTime;
+            })
+            .sort((a, b) => new Date(a.startTime) - new Date(b.startTime))[0];
+          
+          if (!upcomingBlock) return null;
+          
+          const blockStart = new Date(upcomingBlock.startTime);
+          const minutesUntilBlock = Math.floor((blockStart.getTime() - now.getTime()) / (60 * 1000));
+          
+          // Don't allow registration if block starts within 5 minutes
+          if (minutesUntilBlock <= 5) {
+            return {
+              type: 'blocked',
+              reason: upcomingBlock.reason,
+              startTime: upcomingBlock.startTime,
+              minutesUntilBlock
+            };
+          }
+          
+          // Warn if playing time will be limited
+          if (minutesUntilBlock < duration) {
+            return {
+              type: 'limited',
+              reason: upcomingBlock.reason,
+              startTime: upcomingBlock.startTime,
+              limitedDuration: minutesUntilBlock,
+              originalDuration: duration,
+              minutesUntilBlock
+            };
+          }
+          
+          return null;
+        } catch (error) {
+          console.warn('Error checking upcoming blocks:', error);
+          return null;
+        }
+      };
+
       // STEP 5: Court Display Component (from original with DataStore integration)
       const CourtDisplay = ({ 
         courtNumber, 
@@ -1194,6 +1258,20 @@
                         <div className={`${primaryClass} text-center flex-1 flex items-center justify-center`}>
                           {primary}
                         </div>
+                        
+                        {/* Show amber block warning for free courts only */}
+                        {(() => {
+                          if (status !== 'free') return null;
+                          
+                          const blockWarning = getUpcomingBlockWarning(courtNumber, 60);
+                          if (!blockWarning || blockWarning.minutesUntilBlock >= 60) return null;
+                          
+                          return (
+                            <div className="mt-auto text-xs text-center" style={{ color: '#F59E0B', fontWeight: 'normal' }}>
+                              {blockWarning.reason} begins in {blockWarning.minutesUntilBlock}m
+                            </div>
+                          );
+                        })()}
                       </>
                     ) : status === 'blocked' ? (
                       <>

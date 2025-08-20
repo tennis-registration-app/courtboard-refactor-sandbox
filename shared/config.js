@@ -17,7 +17,7 @@
     Timing: {
       SINGLES: 60,
       DOUBLES: 90,
-      MAX_PLAY: 210,
+      MAX_PLAY: 180,
       AVG_GAME: 75,
       AUTO_CLEAR_MIN: 180 // minutes; auto-clear sessions older than this
     },
