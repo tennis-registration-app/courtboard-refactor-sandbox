@@ -828,7 +828,17 @@
         }
         return { primary: 'Overtime', secondary: '' };
       }
-      if (status === 'overtime') return { primary: 'Overtime', secondary: '' };
+      if (status === 'overtime') {
+        // Check if game has been running for over 150 minutes
+        const start = courtObj?.current?.startTime ? new Date(courtObj.current.startTime) : null;
+        if (start) {
+          const minutesPlaying = Math.floor((now - start) / 60000);
+          if (minutesPlaying >= 150) {
+            return { primary: 'Overtime', secondary: 'check status', secondaryColor: 'yellow' };
+          }
+        }
+        return { primary: 'Overtime', secondary: '' };
+      }
       if (status === 'free')     return { primary: 'Available', secondary: '' };
       if (status === 'wet')      return { primary: 'Wet', secondary: '' };
       if (status === 'blocked') {
@@ -1073,7 +1083,8 @@
             .filter(block => 
               block.courtNumber === courtNumber && 
               !block.isWetCourt && // Exclude wet court blocks
-              new Date(block.endTime) >= now
+              new Date(block.startTime) <= now && // Block has started
+              new Date(block.endTime) > now       // Block hasn't ended
             )
             .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
           
@@ -1230,6 +1241,13 @@
                         ) : (
                           <div className="flex-1"></div>
                         )}
+                        
+                        {/* "check status" at the bottom if playing over 150 minutes */}
+                        {secondary && (
+                          <div className="mt-auto text-sm text-center" style={{ color: 'yellow' }}>
+                            {secondary}
+                          </div>
+                        )}
                       </>
                     ) : null}
                   </div>
@@ -1311,18 +1329,45 @@
               <div className="space-y-2 overflow-y-auto mt-4">
                 {waitingGroups.slice(0, TENNIS_CONFIG.DISPLAY.MAX_WAITING_DISPLAY).map((group, idx) => {
 
-                  const availableCourts = courts.filter(court => !court || (court && new Date(court.endTime) <= currentTime));
-                  
-                  // Only first 2 groups can get "You're Up!" (matches registration system limit)
-                  const canRegisterNow = idx < 2 && (idx + 1) <= availableCourts.length;
+                  // Use the same selectable courts logic as the registration system
+                  let canRegisterNow = false;
+                  // Position 1 can register if any courts available
+                  // Position 2 can register if 2+ courts available
+                  if (idx === 0 || idx === 1) {
+                    try {
+                      const data = Storage.readDataSafe();
+                      const now = new Date();
+                      const blocks = Storage.readJSON(Storage.STORAGE.BLOCKS) || [];
+                      const wetSet = new Set();
+                      // Use correct overtime logic: free courts OR overtime courts (not both)
+                      let availableCount = 0;
+                      if (A.getFreeCourtsInfo) {
+                        const info = A.getFreeCourtsInfo({ data, now, blocks, wetSet });
+                        const freeCount = info.free?.length || 0;
+                        const overtimeCount = info.overtime?.length || 0;
+                        availableCount = freeCount > 0 ? freeCount : overtimeCount;
+                      }
+                      
+                      if (idx === 0) {
+                        // First group can register if any courts available
+                        canRegisterNow = availableCount > 0;
+                      } else if (idx === 1) {
+                        // Second group can register if 2+ courts available
+                        canRegisterNow = availableCount >= 2;
+                      }
+                    } catch (error) {
+                      console.warn('Error checking selectable courts for You\'re Up:', error);
+                      canRegisterNow = false;
+                    }
+                  }
                   
                   let estimatedWait = 0;
                   if (!canRegisterNow) {
                     estimatedWait = calculateEstimatedWaitTimeV2(idx + 1);
                   }
 
-                  // Show "You're Up!" if they can register now, OR if wait time is 0 (but limit to first 2 groups)
-                  const showAlert = canRegisterNow || (estimatedWait === 0 && idx < 2);
+                  // Show "You're Up!" only if they can actually register now
+                  const showAlert = canRegisterNow;
 
                   return (
                     <div
@@ -1459,7 +1504,7 @@
       // STEP 7: Next Available Panel Component (from original)
       const NextAvailablePanel = ({ courts, currentTime, waitingGroups = [], courtBlocks = [] }) => {
 
-        const getCourtAvailabilityTimeline = () => {
+        const getCourtAvailabilityTimeline = (waitingGroups = []) => {
           // console.log('🔍 getCourtAvailabilityTimeline called');
           
           if (!courts || !Array.isArray(courts)) {
@@ -1488,7 +1533,7 @@
             
             // console.log(`🏟️ Checking court ${courtNumber}`);
             
-            // Check for active blocks on this court
+            // Check for active blocks on this court (only currently active, not future)
             const activeBlock = courtBlocks.find(block => 
               block.courtNumber === courtNumber && 
               new Date(block.startTime) <= currentTime &&
@@ -1550,8 +1595,34 @@
           // Sort future availability by time
           courtAvailability.sort((a, b) => a.endTime.getTime() - b.endTime.getTime());
           
-          // Combine overtime courts (first) with future availability
-          const combinedAvailability = [...overtimeCourts, ...courtAvailability];
+          // Check if we should show overtime courts as "Now"
+          // Only show overtime as available if there aren't surplus empty courts
+          let filteredOvertimeCourts = overtimeCourts;
+          
+          try {
+            if (USE_SHARED_DOMAIN && A && A.getFreeCourtsInfo) {
+              const now = new Date();
+              const data = Storage.readDataSafe();
+              const blocks = Storage.readJSON(Storage.STORAGE.BLOCKS) || [];
+              const wetSet = new Set(
+                blocks.filter(b => b?.isWetCourt && new Date(b.startTime) <= now && new Date(b.endTime) > now)
+                      .map(b => b.courtNumber)
+              );
+              const info = A.getFreeCourtsInfo({ data, now, blocks, wetSet });
+              const emptyCount = info.free ? info.free.length : 0;
+              const waitingCount = waitingGroups.length;
+              
+              // If there are surplus empty courts, overtime courts aren't truly "available now"
+              if (emptyCount > waitingCount) {
+                filteredOvertimeCourts = [];
+              }
+            }
+          } catch (error) {
+            console.error('Error filtering overtime courts:', error);
+          }
+          
+          // Combine filtered overtime courts (first) with future availability
+          const combinedAvailability = [...filteredOvertimeCourts, ...courtAvailability];
           
           // console.log('📋 Overtime courts:', overtimeCourts);
           // console.log('📋 Future availability:', courtAvailability);
@@ -1608,7 +1679,7 @@
           return courts.some((court, index) => {
             const courtNumber = index + 1;
             
-            // Check if court is blocked
+            // Check if court is blocked (only currently active blocks)
             const isBlocked = courtBlocks.some(block => 
               block.courtNumber === courtNumber && 
               new Date(block.startTime) <= currentTime &&
@@ -1635,17 +1706,32 @@
           });
         };
 
-        const timeline = getCourtAvailabilityTimeline();
+        const timeline = getCourtAvailabilityTimeline(waitingGroups);
         // console.log('🎯 Timeline length:', timeline.length);
         // console.log('🎯 hasEmptyCourts():', hasEmptyCourts());
 
-        const hasAvailableNow = waitingGroups.length === 0 && (hasEmptyCourts() || timeline.some(availability => {
+        // Calculate if courts are available after serving the waitlist
+        let emptyCourtCount = 0;
+        if (USE_SHARED_DOMAIN && A && A.getFreeCourtsInfo) {
           try {
-            return availability.endTime && availability.endTime <= currentTime;
+            const now = new Date();
+            const data = Storage.readDataSafe();
+            const blocks = Storage.readJSON(Storage.STORAGE.BLOCKS) || [];
+            const wetSet = new Set(
+              blocks.filter(b => b?.isWetCourt && new Date(b.startTime) <= now && new Date(b.endTime) > now)
+                    .map(b => b.courtNumber)
+            );
+            const info = A.getFreeCourtsInfo({ data, now, blocks, wetSet });
+            emptyCourtCount = info.free ? info.free.length : 0;
           } catch (error) {
-            return false;
+            console.error('Error getting free court count:', error);
           }
-        }));
+        }
+        
+        // Modified logic: Show "available now" if more empty courts than waiting groups
+        // This accounts for surplus courts after the waitlist is served
+        const surplusCourts = emptyCourtCount - waitingGroups.length;
+        const hasAvailableNow = surplusCourts > 0;
 
         return (
           
@@ -1901,10 +1987,9 @@
           return raw
             .map((g, idx) => {
               const players = Array.isArray(g?.players) ? g.players : [];
-              const guestsArr = Array.isArray(g?.guests)
-                ? g.guests
-                : (Number.isFinite(g?.guests) && g.guests > 0 ? Array(g.guests).fill({ name: 'Guest' }) : []);
-              const names = [...players, ...guestsArr]
+              // Note: guests are already included in the players array with isGuest flag
+              // Don't create fake guest entries - just use the actual player names
+              const names = players
                 .map(p => p?.name || p?.id)
                 .filter(Boolean);
               return names.length ? { id: g.id || `wg_${idx}`, names } : null;
@@ -2177,9 +2262,8 @@
                   {hasWaiting && (
                     <div className="absolute left-[-140px] lg:left-[-100px] xl:left-[-140px]">
                       <svg width="40" height="40" className="lg:w-20 lg:h-20 xl:w-32 xl:h-32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                         
-                        <path d="M5 22V2" stroke="white" strokeWidth="1.5" strokeLinecap="round"></path>
-                        <path d="M5 4C5 4 8 3.5 11 4.5C14 5.5 17 6 17 6L17 8C17 8 14 8.5 11 9.5C8 10.5 5 10 5 10V4Z" fill="#FB923C" stroke="#EA580C" strokeWidth="1"></path>
+                        <path d="M5 20V4" stroke="#D4D4D8" strokeWidth="1.5" strokeLinecap="round"/>
+                        <path d="M5 4L17 7L5 10V4Z" fill="#FB923C" stroke="#EA580C" strokeWidth="1"/>
                       </svg>
                     </div>
                   )}
@@ -2222,7 +2306,7 @@
                       </div>
                     ))}
                   </div>
-                  <div className="h-4 bg-gradient-to-r from-green-600 to-blue-600 mb-4 rounded-full flex-shrink-0 divider-line" />
+                  <div className="h-3 bg-gray-400 mb-4 rounded-full flex-shrink-0 divider-line" />
                   <div className="bottom-section min-h-0 overflow-auto">
                     <WaitingList 
                       waitingGroups={waitingGroups} 
@@ -2316,13 +2400,27 @@
                       };
                       
                       const timeline = getCourtAvailabilityTimelineMobile();
-                      const hasAvailableNow = waitingGroups.length === 0 && (hasEmptyCourts() || timeline.some(availability => {
+                      
+                      // Mobile version - calculate if courts are available after serving waitlist
+                      let mobileEmptyCourtCount = 0;
+                      if (USE_SHARED_DOMAIN && A && A.getFreeCourtsInfo) {
                         try {
-                          return availability.endTime && availability.endTime <= currentTime;
+                          const now = new Date();
+                          const data = Storage.readDataSafe();
+                          const blocks = Storage.readJSON(Storage.STORAGE.BLOCKS) || [];
+                          const wetSet = new Set(
+                            blocks.filter(b => b?.isWetCourt && new Date(b.startTime) <= now && new Date(b.endTime) > now)
+                                  .map(b => b.courtNumber)
+                          );
+                          const info = A.getFreeCourtsInfo({ data, now, blocks, wetSet });
+                          mobileEmptyCourtCount = info.free ? info.free.length : 0;
                         } catch (error) {
-                          return false;
+                          console.error('Error getting mobile free court count:', error);
                         }
-                      }));
+                      }
+                      
+                      const mobileSurplusCourts = mobileEmptyCourtCount - waitingGroups.length;
+                      const hasAvailableNow = mobileSurplusCourts > 0;
                       
                       // Only show if there are courts with future availability times
                       if (hasAvailableNow || timeline.length === 0) {

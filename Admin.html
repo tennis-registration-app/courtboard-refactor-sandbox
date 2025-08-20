@@ -398,7 +398,7 @@ const TENNIS_CONFIG = {
   GUEST_CHARGES_KEY: 'tennisGuestCharges'  // For tracking guest fees
 },
   PRICING: {
-    TENNIS_BALLS: 5.50
+    TENNIS_BALLS: 5.00
   }
 };
 
@@ -1591,7 +1591,12 @@ const InteractiveEvent = ({
       </div>
       {isWeekView && (
         <div className="text-xs opacity-75">
-          Court {event.courtNumbers?.[0] || event.courtNumber}
+          {(() => {
+            const courts = event.courtNumbers || [event.courtNumber];
+            return courts.length === 1 
+              ? `Court ${courts[0]}`
+              : `Courts ${courts.join(', ')}`;
+          })()}
         </div>
       )}
     </div>
@@ -5068,7 +5073,8 @@ const GameHistorySearch = () => {
     courtNumber: '',
     playerName: '',
     startDate: '',
-    endDate: ''
+    endDate: '',
+    clearReason: ''
   });
   const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -5084,6 +5090,7 @@ const GameHistorySearch = () => {
     if (searchFilters.playerName) filters.playerName = searchFilters.playerName;
     if (searchFilters.startDate) filters.startDate = searchFilters.startDate;
     if (searchFilters.endDate) filters.endDate = searchFilters.endDate;
+    if (searchFilters.clearReason) filters.clearReason = searchFilters.clearReason;
 
     // Use shared utils to search historical games
     const results = U.searchHistoricalGames ? U.searchHistoricalGames(filters) : [];
@@ -5096,7 +5103,8 @@ const GameHistorySearch = () => {
       courtNumber: '',
       playerName: '',
       startDate: '',
-      endDate: ''
+      endDate: '',
+      clearReason: ''
     });
     setSearchResults([]);
     setHasSearched(false);
@@ -5123,7 +5131,7 @@ const GameHistorySearch = () => {
       <h3 className="text-lg font-semibold text-gray-800 mb-6">Game History Search</h3>
       
       {/* Search Filters */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-2">Court Number</label>
           <select
@@ -5167,6 +5175,22 @@ const GameHistorySearch = () => {
             onChange={(e) => setSearchFilters(prev => ({ ...prev, endDate: e.target.value }))}
             className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">Clear Reason</label>
+          <select
+            value={searchFilters.clearReason}
+            onChange={(e) => setSearchFilters(prev => ({ ...prev, clearReason: e.target.value }))}
+            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="">All Types</option>
+            <option value="Cleared">Cleared</option>
+            <option value="Observed-Cleared">Observed-Cleared</option>
+            <option value="Admin-Cleared">Admin-Cleared</option>
+            <option value="Auto-Cleared">Auto-Cleared</option>
+            <option value="Bumped">Bumped</option>
+          </select>
         </div>
       </div>
 
@@ -5219,6 +5243,9 @@ const GameHistorySearch = () => {
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Duration
                     </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Clear Reason
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-gray-200">
@@ -5247,6 +5274,18 @@ const GameHistorySearch = () => {
                           const duration = Math.round((new Date(game.endTime) - new Date(game.startTime)) / (1000 * 60));
                           return `${duration} min`;
                         })()}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <span className={`inline-flex px-2 py-1 text-xs font-medium rounded-full ${
+                          game.clearReason === 'Auto-Cleared' ? 'bg-red-100 text-red-800' :
+                          game.clearReason === 'Bumped' ? 'bg-yellow-100 text-yellow-800' :
+                          game.clearReason === 'Observed-Cleared' ? 'bg-orange-100 text-orange-800' :
+                          game.clearReason === 'Cleared' ? 'bg-green-100 text-green-800' :
+                          game.clearReason === 'Admin-Cleared' ? 'bg-gray-100 text-gray-800' :
+                          'bg-gray-100 text-gray-800'
+                        }`}>
+                          {game.clearReason || 'Cleared'}
+                        </span>
                       </td>
                     </tr>
                   ))}
@@ -5576,9 +5615,9 @@ useEffect(() => {
   try {
     const TD = window.TennisDataService || window.Tennis?.DataService || window.Tennis?.Services?.Data;
     if (typeof TD?.clearCourt === 'function') {
-      await TD.clearCourt(courtNumber, { source: 'admin' });
+      await TD.clearCourt(courtNumber, { source: 'admin', clearReason: 'Admin-Cleared' });
     } else if (typeof TD?.unassignCourt === 'function') {
-      await TD.unassignCourt(courtNumber, { source: 'admin' });
+      await TD.unassignCourt(courtNumber, { source: 'admin', clearReason: 'Admin-Cleared' });
     } else {
       throw new Error('No clearCourt/unassignCourt service available');
     }
@@ -5668,11 +5707,19 @@ const existingBlocks = courts.filter(c => c?.blocked).map((c, i) => ({
         return;
       }
 
-      const template = { name, reason, duration: Number(durationMinutes), courts: selectedCourts };
-      const now = new Date();
-
-      // domain: build blocks (one per court)
-      const newBlocks = BL.applyTemplate({ template, now }); // <-- correct call shape
+      // Don't use BL.applyTemplate for scheduled blocks as it always uses "now"
+      // Instead, use the provided start/end times from the form
+      const newBlocks = selectedCourts.map(courtNumber => ({
+        id: block.id || `${Date.now()}-${courtNumber}-${Math.random()}`,
+        courtNumber: courtNumber,
+        reason: reason,
+        title: block.title || name,
+        startTime: block.startTime,  // Use the provided time, not "now"
+        endTime: block.endTime,      // Use the provided time
+        createdAt: new Date().toISOString(),
+        isEvent: block.isEvent,
+        eventDetails: block.eventDetails
+      }));
 
       // load/persist using existing key
       const key = Storage.STORAGE.BLOCKS; // "courtBlocks"
@@ -5943,55 +5990,7 @@ const existingBlocks = courts.filter(c => c?.blocked).map((c, i) => ({
 
 
         {activeTab === 'status' && (
-  <div className="space-y-6 p-6">
-
-    {/* Date Navigation */}
-    <div className="bg-white rounded-lg shadow-sm p-4 mb-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <h3 className="text-lg font-semibold text-gray-800">Court Status</h3>
-        </div>
-        
-        <div className="flex items-center gap-3">
-          <button 
-            onClick={() => {
-              const newDate = new Date(selectedDate);
-              newDate.setDate(newDate.getDate() - 1);
-              setSelectedDate(newDate);
-            }}
-            className="p-2 hover:bg-gray-100 rounded"
-          >
-            <ChevronLeft size={20} />
-          </button>
-
-          <span className="px-4 py-2 bg-blue-50 text-blue-800 rounded-lg font-medium min-w-[120px] text-center">
-            {selectedDate.toDateString() === new Date().toDateString() 
-              ? 'Today' 
-              : selectedDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}
-          </span>
-
-          <button 
-            onClick={() => {
-              const newDate = new Date(selectedDate);
-              newDate.setDate(newDate.getDate() + 1);
-              setSelectedDate(newDate);
-            }}
-            className="p-2 hover:bg-gray-100 rounded"
-          >
-            <ChevronRight size={20} />
-          </button>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setSelectedDate(new Date())}
-            className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700"
-          >
-            Today
-          </button>
-        </div>
-      </div>
-    </div>
+  <div className="p-6">
 
     <CourtStatusGrid
       courts={courts}

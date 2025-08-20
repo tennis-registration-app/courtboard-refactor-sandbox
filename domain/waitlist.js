@@ -170,10 +170,30 @@
       ? Math.floor(avgGameMinutes) : (window.Tennis?.Config?.Timing?.AVG_GAME || 75);
     const total = window.Tennis?.Config?.Courts?.TOTAL_COUNT || (nextFreeTimes?.length || 12);
     const times = [];
-    for (let i = 0; i < Math.min(currentFreeCount, total); i++) times.push(now);
-    for (let i = times.length; i < total; i++) {
-      const t = nextFreeTimes?.[i] ? new Date(nextFreeTimes[i]) : now;
-      times.push(t);
+    
+    // Build array of court availability times
+    // First, add 'now' for each currently free court
+    for (let i = 0; i < Math.min(currentFreeCount, total); i++) {
+      times.push(now);
+    }
+    
+    // Then add the actual next free times for all courts
+    // We need ALL courts in the times array, not just occupied ones
+    if (nextFreeTimes && Array.isArray(nextFreeTimes)) {
+      for (let courtIdx = 0; courtIdx < total; courtIdx++) {
+        const nextFreeTime = nextFreeTimes[courtIdx] ? new Date(nextFreeTimes[courtIdx]) : now;
+        
+        // Skip courts we already added as "free now"
+        // Free courts should have nextFreeTime = now, but occupied courts have future times
+        if (nextFreeTime > now) {
+          times.push(nextFreeTime);
+        }
+      }
+    }
+    
+    // If we don't have enough times, pad with 'now'
+    while (times.length < total) {
+      times.push(now);
     }
     // simple min-heap via array ops (n is small)
     const popMinIdx = () => {

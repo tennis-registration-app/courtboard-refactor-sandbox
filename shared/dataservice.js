@@ -39,13 +39,28 @@
     }
 
     const nowISO = new Date().toISOString();
+    const gameData = court.current || {};
+    
     // Preserve history
     court.history = Array.isArray(court.history) ? court.history.slice() : [];
     court.history.push({
-      ...(court.current || {}),
+      ...gameData,
       clearedAt: nowISO,
       reason: opts.reason || 'manual-clear'
     });
+    
+    // Add to historical games for search functionality
+    if (window.APP_UTILS && window.APP_UTILS.addHistoricalGame && gameData.players) {
+      window.APP_UTILS.addHistoricalGame({
+        courtNumber: courtNumber,
+        players: gameData.players,
+        startTime: gameData.startTime,
+        endTime: nowISO, // Use actual clear time for accuracy
+        duration: gameData.duration,
+        clearReason: opts.clearReason || 'Cleared'
+      });
+    }
+    
     // Clear current
     court.current = null;
 
@@ -105,18 +120,19 @@
         ? R.enrichPlayersWithIds(players, window.__memberRoster || [])
         : players;
 
+      // Get waitlist data once
+      const waiting = Array.isArray(data.waitingGroups) ? data.waitingGroups : [];
+      const isFirstWaitingGroup = waiting.length > 0 && sameGroup(waiting[0]?.players || [], players);
+
       for (const p of groupWithIds) {
         const engagement = R?.findEngagementFor ? R.findEngagementFor(p, data) : null;
         if (engagement?.type === 'playing') {
           return { success: false, error: `${p.name || p} is already playing on Court ${engagement.court}` };
         }
-        if (engagement?.type === 'waitlist') {
-          return { success: false, error: `${p.name || p} is already on the waitlist (position ${engagement.position})` };
-        }
+        // Skip waitlist blocking here - let the comprehensive waitlist priority check handle it below
       }
       
       // 2) THEN waitlist priority check
-      const waiting = Array.isArray(data.waitingGroups) ? data.waitingGroups : [];
       
       console.log('[assignCourt] Waitlist check:', { 
         waitingLength: waiting.length, 
@@ -125,15 +141,42 @@
         firstWaitingGroup: waiting[0]?.players 
       });
       
-      // If anyone is waiting, only allow assignment if this group IS the first waiting group,
-      // or an explicit override flag is provided (for Admin-only flows).
+      // Check waitlist priority - modified to allow top 2 groups when 2+ courts available
       if (waiting.length > 0 && !opts?.overrideWaitlist) {
-        const first = waiting[0];
-        const isSameGroup = sameGroup(first?.players || [], players);
-        console.log('[assignCourt] Group comparison:', { isSameGroup, firstPlayers: first?.players, currentPlayers: players });
+        // Get available courts count to determine how many groups can play
+        // Use correct overtime logic: free courts OR overtime courts (not both)
+        let availableCourtCount = 0;
+        if (Av?.getFreeCourtsInfo) {
+          const info = Av.getFreeCourtsInfo({ data, now, blocks, wetSet });
+          const freeCount = info.free?.length || 0;
+          const overtimeCount = info.overtime?.length || 0;
+          availableCourtCount = freeCount > 0 ? freeCount : overtimeCount;
+        }
         
-        if (!isSameGroup) {
-          return { success: false, error: 'Waitlist priority: please use "Assign next" or join the waitlist.' };
+        // Check if this group is in the allowed positions
+        let groupPosition = 0;
+        for (let i = 0; i < waiting.length; i++) {
+          if (sameGroup(waiting[i]?.players || [], players)) {
+            groupPosition = i + 1; // 1-based position
+            break;
+          }
+        }
+        
+        console.log('[assignCourt] Waitlist priority check:', { 
+          groupPosition, 
+          availableCourtCount,
+          waitingLength: waiting.length,
+          players: players
+        });
+        
+        // Allow position 1 always, position 2 only if 2+ courts available
+        const maxAllowedPosition = availableCourtCount >= 2 ? 2 : 1;
+        
+        if (groupPosition === 0 || groupPosition > maxAllowedPosition) {
+          return { 
+            success: false, 
+            error: `Waitlist priority: ${groupPosition === 0 ? 'please join the waitlist' : `position ${groupPosition} must wait (only top ${maxAllowedPosition} can play)`}.` 
+          };
         }
       }
 
@@ -196,6 +239,45 @@
         };
       });
       
+      // If court has an existing game (overtime), preserve it in history before replacing
+      if (court.current) {
+        const existingGame = court.current;
+        const nowISO = now.toISOString();
+        
+        console.log('[assignCourt] BUMPING existing game:', {
+          courtNumber,
+          existingGame: {
+            players: existingGame.players?.map(p => p.name),
+            startTime: existingGame.startTime,
+            endTime: existingGame.endTime
+          },
+          bumpTime: nowISO
+        });
+        
+        // Preserve in court history
+        court.history = Array.isArray(court.history) ? court.history : [];
+        court.history.push({
+          ...existingGame,
+          clearedAt: nowISO,
+          clearReason: 'Bumped'
+        });
+        
+        // Add to historical games for search functionality
+        if (window.APP_UTILS && window.APP_UTILS.addHistoricalGame) {
+          console.log('[assignCourt] Adding bumped game to historical storage');
+          window.APP_UTILS.addHistoricalGame({
+            courtNumber: courtNumber,
+            players: existingGame.players,
+            startTime: existingGame.startTime,
+            endTime: nowISO, // Use bump time as end time
+            duration: existingGame.duration,
+            clearReason: 'Bumped'
+          });
+        } else {
+          console.warn('[assignCourt] APP_UTILS.addHistoricalGame not available');
+        }
+      }
+      
       court.current = {
         players: normalizedPlayers,
         guests: group?.guests || 0,
@@ -207,8 +289,14 @@
       };
 
       // If this was from waitlist, remove from waitlist
-      if (waiting.length > 0 && sameGroup(waiting[0]?.players || [], players)) {
-        data.waitingGroups = waiting.slice(1);
+      // Check both position 1 and 2 since either could have been assigned
+      if (waiting.length > 0) {
+        for (let i = 0; i < Math.min(2, waiting.length); i++) {
+          if (sameGroup(waiting[i]?.players || [], players)) {
+            data.waitingGroups.splice(i, 1);
+            break;
+          }
+        }
       }
 
       // Bump tick
@@ -266,23 +354,27 @@
         const data = S.readDataClone();
         if (!data.waitingGroups?.length) return { success:false, error:'No one is waiting' };
 
-        // Build strict set
+        // Use getFreeCourtsInfo for assignment - get fresh reference to availability module
         const now = new Date();
         const blocks = S.readJSON(S.STORAGE.BLOCKS) || [];
         const wetSet = new Set();
-        const strict = [...(Av.getSelectableCourtsStrict?.({ data, now, blocks, wetSet }) || [])];
+        
+        // Get fresh availability module reference
+        const AvRuntime = T.Domain?.availability || T.Domain?.Availability || {};
+        
+        let freeCourts = [];
+        if (AvRuntime.getFreeCourtsInfo) {
+          const courtInfo = AvRuntime.getFreeCourtsInfo({ data, now, blocks, wetSet });
+          freeCourts = courtInfo?.free || [];
+        } else if (AvRuntime.getFreeCourts) {
+          // Fallback to basic getFreeCourts if getFreeCourtsInfo not available
+          freeCourts = AvRuntime.getFreeCourts({ data, now, blocks, wetSet }) || [];
+        }
 
-        console.log('[assignNextFromWaitlist] DEBUG:', {
-          waitingGroups: data.waitingGroups?.length || 0,
-          selectableCourts: strict,
-          courtNumber,
-          requestedCourt: Number(courtNumber) || strict[0]
-        });
-
-        // Choose court
-        const court = Number(courtNumber) || strict[0];
-        if (!court || !strict.includes(court)) {
-          return { success:false, error:`No selectable courts (available: [${strict.join(',')}])` };
+        // Choose court - use requested court if free, otherwise first free court
+        const court = Number(courtNumber) || freeCourts[0];
+        if (!court || !freeCourts.includes(court)) {
+          return { success:false, error:`No free courts available (free: [${freeCourts.join(',')}])` };
         }
 
         // Pop first waiting group

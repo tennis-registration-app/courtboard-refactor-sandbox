@@ -19,7 +19,40 @@
       : JSON.parse(JSON.stringify(S.readDataSafe()));
     const overdue = listOverdueCourts(data, now);
     if (!overdue.length) return 0;
-    overdue.forEach(n => { if (data.courts[n - 1]) data.courts[n - 1].current = null; });
+    
+    const nowISO = now.toISOString();
+    
+    // Preserve game history and add to historical games storage for each auto-cleared court
+    overdue.forEach(courtNumber => {
+      const court = data.courts[courtNumber - 1];
+      if (court && court.current) {
+        const gameData = court.current;
+        
+        // Preserve in court history
+        court.history = Array.isArray(court.history) ? court.history : [];
+        court.history.push({
+          ...gameData,
+          clearedAt: nowISO,
+          clearReason: 'Auto-Cleared'
+        });
+        
+        // Add to historical games for search functionality
+        if (window.APP_UTILS && window.APP_UTILS.addHistoricalGame) {
+          window.APP_UTILS.addHistoricalGame({
+            courtNumber: courtNumber,
+            players: gameData.players,
+            startTime: gameData.startTime,
+            endTime: nowISO, // Use auto-clear time as end time
+            duration: gameData.duration,
+            clearReason: 'Auto-Cleared'
+          });
+        }
+        
+        // Clear the court
+        court.current = null;
+      }
+    });
+    
     // Persist via service if available, else storage
     if (window.TennisDataService?.saveData) {
       await window.TennisDataService.saveData(data);

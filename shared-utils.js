@@ -147,6 +147,7 @@
   const getHistoricalGames = () => readJSON(STORAGE.HISTORICAL_GAMES) || [];
   
   const addHistoricalGame = (game) => {
+    console.log('[addHistoricalGame] Called with:', game);
     const games = getHistoricalGames();
     const gameRecord = {
       ...game,
@@ -154,8 +155,10 @@
       dateAdded: new Date().toISOString(),
       date: new Date(game.startTime).toISOString().split('T')[0] // YYYY-MM-DD format
     };
+    console.log('[addHistoricalGame] Saving game record:', gameRecord);
     games.push(gameRecord);
     writeJSON(STORAGE.HISTORICAL_GAMES, games);
+    console.log('[addHistoricalGame] Total games now:', games.length);
     return gameRecord;
   };
 
@@ -185,6 +188,11 @@
           player.name.toLowerCase().includes(searchName)
         );
         if (!hasPlayer) return false;
+      }
+      
+      // Clear reason filter (exact match)
+      if (filters.clearReason) {
+        if (game.clearReason !== filters.clearReason) return false;
       }
       
       return true;
