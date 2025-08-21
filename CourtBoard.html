@@ -799,7 +799,7 @@
       }
       // free, wet, blocked etc.
       if (status === 'free') return 'Available';
-      if (status === 'wet') return 'Wet';
+      if (status === 'wet') return '🌧️\nWET COURT';
       if (status === 'blocked') {
         const label = courtObj?.blockedLabel || 'Blocked';
         const until = courtObj?.blockedEnd ? courtObj.blockedEnd : null;
@@ -843,7 +843,7 @@
         return { primary: 'Overtime', secondary: '' };
       }
       if (status === 'free')     return { primary: 'Available', secondary: '' };
-      if (status === 'wet')      return { primary: 'Wet', secondary: '' };
+      if (status === 'wet')      return { primary: '🌧️\nWET COURT', secondary: '' };
       if (status === 'blocked') {
         const s = courtObj || {};
         const label = s.blockedLabel || 'Blocked';
@@ -1256,7 +1256,14 @@
                     {status === 'free' || status === 'wet' ? (
                       <>
                         <div className={`${primaryClass} text-center flex-1 flex items-center justify-center`}>
-                          {primary}
+                          {status === 'wet' ? (
+                            <div className="flex flex-col items-center">
+                              <div style={{ fontSize: '2.5em', lineHeight: '1' }}>🌧️</div>
+                              <div className="mt-1">WET COURT</div>
+                            </div>
+                          ) : (
+                            primary
+                          )}
                         </div>
                         
                         {/* Show amber block warning for free courts only */}
